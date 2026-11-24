@@ -42,6 +42,12 @@ enum MediaClassifier {
             && !musicApps.contains(track.bundleID) && !videoApps.contains(track.bundleID)
     }
 
+    /// Neither a known music app nor a known video app (a browser, mostly):
+    /// its first lengths can't be trusted.
+    static func isUnlisted(_ track: NowPlaying) -> Bool {
+        !musicApps.contains(track.bundleID) && !videoApps.contains(track.bundleID)
+    }
+
     /// `longerThan` is in minutes; 0 means never hide anything.
     static func kind(for track: NowPlaying, longerThan minutes: Int) -> MediaKind {
         if musicApps.contains(track.bundleID) { return .music }
