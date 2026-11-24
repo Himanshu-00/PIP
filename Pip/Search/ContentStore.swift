@@ -77,28 +77,65 @@ actor ContentStore {
             return
         }
         ready = true
-        // Fails harmlessly when the column is already there.
-        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN headings TEXT")
-        // A photo's one-line description from Pip's vision (`PhotoCaptions`).
-        // NULL = not captioned yet, '' = looked at, nothing to say (too small).
-        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN caption TEXT")
-        // A document's one-line description from Pip's brain (`DocumentNotes`):
-        // what kind of file it is and what it's about, in the model's own words.
-        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN about TEXT")
-        // The kind of file it is ("research paper", "rent receipt"), as Pip
-        // files it — so a search for a kind goes straight to its group.
-        // `kind_by`: 'pip' (his brain said so) or 'line' (read from his
-        // description until he looks again, `DocumentNotes`).
-        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN kind TEXT")
-        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN kind_by TEXT")
-        SQLite.exec(database, "CREATE INDEX IF NOT EXISTS documents_kind ON documents(kind)")
+        bridgeVersions()
         v2Ready = createSchemaV2()
-        if v2Ready { runOneTimeFixes() }
+        v2Copied = metaValue("v2_copied") == "1"
+        SQLite.migrate(database, "content.db", migrations)
         SQLite.excludeFromBackup(location)
     }
 
-    /// Corrections to what earlier builds stored, each run once (a `meta` key
-    /// records it).
+    /// Before migrations, `user_version` said whether the v2 index copy had
+    /// finished (2) or not (1). Once: that moves to `meta`, and the version
+    /// starts counting migrations.
+    private func bridgeVersions() {
+        SQLite.exec(database, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        guard metaValue("versions") == nil else { return }
+        let legacy = SQLite.userVersion(database)
+        SQLite.exec(database, "BEGIN")
+        setMeta("v2_copied", legacy >= 2 ? "1" : "0")
+        SQLite.exec(database, "PRAGMA user_version = 0")
+        setMeta("versions", "1")
+        SQLite.exec(database, "COMMIT")
+    }
+
+    /// The layout's changes, in order (`SQLite.migrate`). Each is harmless on
+    /// a database that already has it.
+    private var migrations: [SQLite.Migration] {
+        [
+            SQLite.Migration(version: 1, name: "documents.headings") {
+                SQLite.addColumn($0, "documents", "headings", "TEXT")
+            },
+            // A photo's one-line description from Pip's vision (`PhotoCaptions`).
+            // NULL = not captioned yet, '' = looked at, nothing to say (too small).
+            SQLite.Migration(version: 2, name: "documents.caption") {
+                SQLite.addColumn($0, "documents", "caption", "TEXT")
+            },
+            // A document's one-line description from Pip's brain (`DocumentNotes`).
+            SQLite.Migration(version: 3, name: "documents.about") {
+                SQLite.addColumn($0, "documents", "about", "TEXT")
+            },
+            // The kind of file it is ("research paper", "rent receipt"), as Pip
+            // files it — so a search for a kind goes straight to its group.
+            // `kind_by`: 'pip' (his brain said so) or 'line' (read from his
+            // description until he looks again, `DocumentNotes`).
+            SQLite.Migration(version: 4, name: "documents.kind") {
+                SQLite.addColumn($0, "documents", "kind", "TEXT")
+                    && SQLite.addColumn($0, "documents", "kind_by", "TEXT")
+                    && SQLite.exec($0, "CREATE INDEX IF NOT EXISTS documents_kind ON documents(kind)")
+            },
+            SQLite.Migration(version: 5, name: "one-time fixes") { [unowned self] _ in
+                guard v2Ready else { return false }
+                runOneTimeFixes()
+                return true
+            },
+        ]
+    }
+
+    /// Whether the v2 index holds every stored document yet (`migrateStep`).
+    private var v2Copied = false
+
+    /// Corrections to what earlier builds stored, each guarded by its own
+    /// `meta` key (they predate migrations), so running them again is harmless.
     private func runOneTimeFixes() {
         // Searches used to read whatever Spotlight returned, ~/Library
         // included. The tables above are cleared on every open; these are the
@@ -203,7 +240,7 @@ actor ContentStore {
 
     /// Version 2: `files` (every file in the usual folders), `search_fts` (name
     /// ×8, title ×6, headings ×4, text ×1) and `names_trigram` (any part of a
-    /// name). `user_version` 2 = migration from v1 finished.
+    /// name). `meta.v2_copied` = 1 once every v1 document is copied in.
     private func createSchemaV2() -> Bool {
         // The index's columns changed (headings were added). FTS5 tables
         // can't gain a column, so an older one is dropped and rebuilt from
@@ -212,7 +249,7 @@ actor ContentStore {
         let layout = "name,title,headings,text"
         if metaValue("search_fts_layout") != layout {
             SQLite.exec(database, "DROP TABLE IF EXISTS search_fts")
-            SQLite.exec(database, "PRAGMA user_version = 1")
+            setMeta("v2_copied", "0")
             setMeta("v2_migrated_upto", "0")
             setMeta("search_fts_layout", layout)
         }
@@ -453,7 +490,7 @@ actor ContentStore {
     func migrateStep(limit: Int = 400) -> Bool {
         open()
         guard v2Ready, let database else { return false }
-        if SQLite.userVersion(database) >= 2 { return true }
+        if v2Copied { return true }
         let after = Int64(metaValue("v2_migrated_upto") ?? "0") ?? 0
 
         var statement: OpaquePointer?
@@ -470,7 +507,8 @@ actor ContentStore {
         sqlite3_finalize(statement)
 
         guard let last = rows.last else {
-            SQLite.exec(database, "PRAGMA user_version = 2")
+            setMeta("v2_copied", "1")
+            v2Copied = true
             ActivityLog.write(.search, "content store: v2 index ready")
             return true
         }
@@ -484,7 +522,7 @@ actor ContentStore {
     /// Search over what documents say (title, headings, text; not the name):
     /// exact phrase first, then any word. Nil until v2 is ready.
     private func searchV2(words: [String], limit: Int, extensions: Set<String> = []) -> [Hit]? {
-        guard v2Ready, SQLite.userVersion(database) >= 2, let database else { return nil }
+        guard v2Ready, v2Copied, let database else { return nil }
         var hits: [Hit] = []
         var seen = Set<String>()
 
