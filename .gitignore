@@ -24,8 +24,9 @@ CLAUDE.md
 # Claude Code skills (third-party, local only)
 .claude/
 
-# Built app (attach to a GitHub Release instead)
-*.dmg
+Screenshots/
 
-# Keeps Spotlight out of this folder (local only)
 .metadata_never_index
+
+Pip 1.0.dmg
+
