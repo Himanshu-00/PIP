@@ -1,120 +1,159 @@
+<div align="center">
+
+<img src="Screenshots/icon.png" width="128" alt="Pip's icon: a glowing glass bubble with two eyes">
+
 # Pip
 
-Pip turns the MacBook notch into a small live island, and lives in it: an
-AI helper that runs entirely on your Mac. His main job is your files —
-finding them, understanding what they are, keeping them tidy and telling you
-what's in them.
+**An AI that lives in your MacBook notch and knows your files.**<br>
+Fully on-device — nothing you ask, say or keep leaves your Mac.
 
-Nothing you ask, say or keep leaves the Mac. The only things that use the
-network are web searches, pages Pip reads for you, and the one-time model
-downloads.
-
-<p align="center">
-  <img src="Screenshots/pip-idle.png" width="420" alt="Pip, a glass bubble with two eyes, in the open notch above his search bar: Ask Pip, or type a file">
+<p>
+  <img src="https://img.shields.io/badge/macOS-14%2B-000000?logo=apple&logoColor=white" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Apple%20Silicon-required-333333" alt="Apple Silicon">
+  <img src="https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white" alt="Swift and SwiftUI">
+  <img src="https://img.shields.io/badge/LLM-MLX%20·%20Qwen3.5--9B-7B61FF" alt="MLX, Qwen3.5-9B">
+  <img src="https://img.shields.io/badge/licence-MIT-2EA44F" alt="MIT licence">
 </p>
 
-## Files, understood
+<img src="Screenshots/pip-idle.png" width="520" alt="Pip, a glass bubble with two eyes, in the open notch above his search bar">
 
-Pip doesn't sort your files into a fixed list of categories. He reads each
-document and says in a line what it is — "RLHF paper on summarizing from
-feedback", "Receipt for a phone case", "Week 7 slides on research methods" —
-from its text, its name, its folder and the files beside it. That line is
-searchable, shows under the file in results, and decides how results are
-grouped and how folders are organised.
+[Files](#-finds-anything-understands-everything) ·
+[Ask](#-ask-him-anything) ·
+[The island](#-the-island) ·
+[How it works](#-how-it-works) ·
+[Build](#-build-it)
 
-<p align="center">
-  <img src="Screenshots/pip-papers-grouped.png" width="560" alt="Asked to find all research papers, Pip lists them under a Papers header, each with his one-line description, such as Attention paper on transformer architecture and Retentive Network paper">
-</p>
-<p align="center"><sub>"find all research paper": grouped by what Pip says each file is</sub></p>
+</div>
 
-- **Ask in your own words.** "find papers about attn", "the rent receipt from
-  March", "slides I downloaded last week". Abbreviations, typos, dates and
-  folders are understood.
-- **Described on the spot.** Results Pip hasn't read yet are described as
-  you look at them, and the list regroups as each line lands. The rest of
-  your documents are described while the Mac is idle and plugged in.
-- **Grouped by kind.** Results that are the same kind of file (papers,
-  slides, receipts…) are shown together under a name taken from Pip's own
-  descriptions.
-- **Answers from inside files.** "how much rent did I pay last month?",
-  "when is my flight?" — read from the documents themselves, with the files
-  shown below the answer.
-- **Tidying.** Move, copy, rename, collect into a folder, find duplicates,
-  suggest better names, organise a folder into folders named after what's in
-  them. Everything he changes can be undone. Apps are never moved or renamed.
+---
 
-<p align="center">
-  <img src="Screenshots/pip-find-attn.png" width="560" alt="Pip answering Can you find me paper about attn? with five files, the Attention Is All You Need paper first">
-</p>
+## ✨ Why Pip
 
-## Everything else
+<table>
+<tr>
+<td width="33%" valign="top">
 
-<p align="center">
-  <img src="Screenshots/pip-listening.png" width="190" alt="Pip listening after the talk key, with Listening… in his bar">
-  <img src="Screenshots/pip-thinking.png" width="190" alt="Pip thinking, with an aurora moving inside him">
-  <img src="Screenshots/pip-searching-web.png" width="230" alt="Pip with his eyes closed, Searching the web… under him">
-</p>
-<p align="center"><sub>Listening (⌥V) · thinking · searching the web</sub></p>
+### 🔒 Private
+The brain, the voice, the search and every index run on your Mac. Only web searches you ask for touch the network.
 
-**Pip, in the notch**
-- Ask by typing or by voice (⌥V to talk, again to stop). He answers in his
-  own voice, with explanations laid out as a headline, a paragraph and points.
-- Questions, facts and conversions go through a web search first
-  (DuckDuckGo), so answers are current; he can show pictures from the web too.
-- Everyday jobs: volume, open apps, play music, timers, notes, screenshots,
-  and summarising long text you copy.
+</td>
+<td width="33%" valign="top">
 
-<p align="center">
-  <img src="Screenshots/pip-web.png" width="520" alt="Pip answering why is the sky blue? in the notch: a headline, three numbered points, a From the web chip, and Copy, Shorter and More detail">
-  <img src="Screenshots/pip-pictures.png" width="300" alt="Ten pictures of the northern lights in two rows under Pip's answer">
-</p>
+### 🧠 Understands files
+Pip reads your documents and says what each one *is* — no fixed categories — so "research papers" finds papers, whatever they're called.
 
-**Search (⌥F)**
-- File names, what's inside documents (PDFs, Office files, scans via OCR),
-  what they're about, and photos by how they look.
-- Built from Spotlight, a local full-text index (SQLite FTS5), Apple's
-  sentence embedding and Apple's MobileCLIP for photos — all on-device.
+</td>
+<td width="33%" valign="top">
 
-**Click to ask (⌥⇧A)**
-- Click any picture, or drag over text, anywhere on screen; Pip explains it
-  in a panel beside it.
+### 🗣️ Talks back
+Ask by typing or by voice. He answers in his own voice, with clear layouts for explanations.
 
-**The island**
+</td>
+</tr>
+</table>
 
-<p align="center">
-  <img src="Screenshots/island-panel.png" width="640" alt="The island opened on hover: a Search files bar, a now-playing chip with cover art, and a row of recent screenshots">
-</p>
+---
 
-- Now playing with artwork and controls, charging and low battery, finished
-  downloads (with an offer to rename or file them), a shelf of recent
-  screenshots, and a shelf to park files on and drag out later.
+## 📂 Finds anything, understands everything
 
-⌃⎋ stops whatever Pip is doing.
+<table>
+<tr>
+<td width="55%"><img src="Screenshots/pip-papers-grouped.png" alt="Asked to find all research papers, Pip lists them under a Papers header, each with his one-line description"></td>
+<td valign="top">
 
-## How it works
+**Every document gets a line in Pip's own words** — *"RLHF paper on summarizing from feedback"*, *"Week 7 slides on research methods"* — from its text, name, folder and neighbours.
 
-- **Brain:** Qwen3.5-9B (4-bit) on [MLX](https://github.com/ml-explore/mlx-swift),
-  with its own tool loop, ported by hand in `Pip/Brain`. Ollama is used as a
-  fallback if the built-in brain isn't downloaded.
-- **Understanding files:** the same brain writes each document's one-line
-  description; groups come from the kind of file it names, then from meaning
-  (Apple's sentence embedding). No list of categories anywhere.
-- **Voice:** Kokoro-82M, vendored in `Pip/Voice/Kokoro`. **Listening:** Apple's
-  on-device speech recognition (`SpeechAnalyzer` on macOS 26).
-- **Eyes:** Qwen3.5's vision encoder, for screenshots and photos.
+That line is searchable, shows under each result, and groups results by kind: **Papers**, **Slides**, **Receipts**… named by Pip, not hardcoded.
 
-## Requirements
+</td>
+</tr>
+</table>
 
-- A MacBook with a notch and Apple silicon (MLX runs on the Apple GPU).
-- macOS 14 or later. Liquid Glass and the newer speech model need macOS 26.
-- About 7 GB of disk for the models, downloaded on first use:
-  the brain (~6 GB), the voice (~330 MB) and MobileCLIP (~200 MB). The brain
-  needs about 6 GB of memory while it's loaded.
+- **Ask in your own words** — *"paper about attn"*, *"the rent receipt from March"*, *"slides I downloaded last week"*. Typos, abbreviations, dates and folders all work.
+- **Answers from inside files** — *"how much rent did I pay last month?"* is read from the documents themselves.
+- **Keeps things tidy** — move, copy, rename, find duplicates, suggest better names, and organise a folder into folders named after what's in them. Everything can be undone.
 
-## Building
+<div align="center">
+<img src="Screenshots/pip-find-attn.png" width="620" alt="Pip answering Can you find me paper about attn? with the Attention Is All You Need paper first">
+</div>
 
-Open `Pip.xcodeproj`, choose your Team under Signing & Capabilities, and run
-(⌘R). The only package is `mlx-swift`, fetched by Xcode.
+---
+
+## 💬 Ask him anything
+
+<div align="center">
+<table>
+<tr>
+<td align="center"><img src="Screenshots/pip-listening.png" width="200" alt="Pip listening"><br><sub><b>Listening</b> · ⌥V</sub></td>
+<td align="center"><img src="Screenshots/pip-thinking.png" width="200" alt="Pip thinking, with an aurora inside him"><br><sub><b>Thinking</b></sub></td>
+<td align="center"><img src="Screenshots/pip-searching-web.png" width="250" alt="Pip searching the web"><br><sub><b>Searching the web</b></sub></td>
+</tr>
+</table>
+</div>
+
+Questions, facts and conversions go through a web search first, so answers are current — laid out as a headline, a paragraph and points, with pictures when they help.
+
+<div align="center">
+<img src="Screenshots/pip-web.png" width="480" alt="Pip explaining why the sky is blue: a headline, numbered points and a From the web chip">
+<img src="Screenshots/pip-pictures.png" width="340" alt="Ten pictures of the northern lights in two rows">
+</div>
+
+Plus the everyday jobs: volume, apps, music, timers, notes, screenshots, and summarising long text you copy. **Click to ask** (⌥⇧A) explains any picture or text on screen in a panel beside it.
+
+---
+
+## 🏝️ The island
+
+<div align="center">
+<img src="Screenshots/island-panel.png" width="760" alt="The island opened on hover: a search bar, a now-playing chip and recent screenshots">
+</div>
+
+Hover the notch for search, now playing, and your recent screenshots. The island also shows charging and low battery, finished downloads (with an offer to rename or file them), and a shelf to park files on and drag out later.
+
+### Shortcuts
+
+| Keys | Does |
+|---|---|
+| <kbd>⌥</kbd> <kbd>F</kbd> | Search files |
+| <kbd>⌥</kbd> <kbd>V</kbd> | Talk to Pip (again to stop) |
+| <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>A</kbd> | Click to ask |
+| <kbd>⌃</kbd> <kbd>⎋</kbd> | Stop whatever Pip is doing |
+
+---
+
+## ⚙️ How it works
+
+| | |
+|---|---|
+| **Brain** | Qwen3.5-9B (4-bit) on [MLX](https://github.com/ml-explore/mlx-swift), with its own tool loop — Ollama as a fallback |
+| **Voice** | Kokoro-82M, vendored in `Pip/Voice/Kokoro` |
+| **Listening** | Apple's on-device speech recognition (`SpeechAnalyzer` on macOS 26) |
+| **Eyes** | Qwen3.5's vision encoder, for screenshots and photos |
+| **Search** | Spotlight + SQLite FTS5 (BM25) + Apple sentence embeddings + MobileCLIP |
+
+<details>
+<summary><b>How search finds a file</b></summary>
+<br>
+
+1. **Understand the query** — words, file type, time ("last month") and folder.
+2. **Ask every source at once** — known names (instant), Spotlight, the full-text index, meaning, and photos by how they look.
+3. **Rank** — name match, text match (BM25 or meaning), recency, how often it's opened and type, weighted; files holding every word go first.
+4. **Read more only if needed** — unread files are opened and scored, going back in time until there's an answer.
+5. **Describe and group** — results Pip hasn't described yet are described on the spot, and the list regroups by kind as each line lands.
+
+Results update live: names in ~60 ms, the rest within a second.
+
+</details>
+
+---
+
+## 🛠️ Build it
+
+**Needs** a MacBook with a notch and Apple silicon, macOS 14 or later (Liquid Glass and the newer speech model need macOS 26), and ~7 GB of disk for models downloaded on first use: brain ~6 GB, voice ~330 MB, MobileCLIP ~200 MB.
+
+1. Open `Pip.xcodeproj`
+2. Choose your Team under **Signing & Capabilities**
+3. Run with <kbd>⌘</kbd> <kbd>R</kbd> — the only package, `mlx-swift`, is fetched by Xcode
 
 Optional, so the island sees music and video in browsers:
 
@@ -124,7 +163,9 @@ brew tap ungive/media-control && brew install media-control
 
 `Scripts/install.sh` builds a Release copy into /Applications.
 
-## Permissions
+<details>
+<summary><b>Permissions</b></summary>
+<br>
 
 macOS asks for each the first time it's needed:
 
@@ -135,13 +176,24 @@ macOS asks for each the first time it's needed:
 | Accessibility | Click to ask, media keys |
 | Automation | Music and Spotify, Notes, Mac settings you ask him to change |
 
-## Data on your Mac
+</details>
+
+<details>
+<summary><b>Where data lives</b></summary>
+<br>
 
 - `~/Library/Application Support/Pip/` — models, search indexes, descriptions, conversations
 - `~/Library/Caches/Pip App/` — caches
 - `~/Library/Logs/Pip/` — a daily activity log
 
-## Licence
+</details>
 
-MIT — see [LICENSE](LICENSE). The vendored Kokoro code and the downloaded
-models keep their own licences.
+---
+
+<div align="center">
+
+**MIT** — see [LICENSE](LICENSE). The vendored Kokoro code and the downloaded models keep their own licences.
+
+<sub>Made by Himanshu</sub>
+
+</div>
