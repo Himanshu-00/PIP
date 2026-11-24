@@ -313,6 +313,8 @@ final class ContentIndexer {
             let finished = await self.photoVectorBacklog()
             self.vectoring = false
             guard finished else { return }
+            // Space a migration freed, given back once while nobody's using the Mac.
+            if Self.macIsIdle { await ContentStore.shared.vacuumIfPending() }
             // Documents described before photos captioned: files come first.
             if await DocumentNotes.shared.hasWork() {
                 DocumentNotes.shared.startIfIdle()

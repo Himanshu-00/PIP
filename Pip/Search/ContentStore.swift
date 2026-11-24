@@ -81,6 +81,7 @@ actor ContentStore {
         v2Ready = createSchemaV2()
         v2Copied = metaValue("v2_copied") == "1"
         SQLite.migrate(database, "content.db", migrations)
+        contentless = v2Ready && !SQLite.hasColumn(database, "search_fts", "path")
         SQLite.excludeFromBackup(location)
     }
 
@@ -128,7 +129,79 @@ actor ContentStore {
                 runOneTimeFixes()
                 return true
             },
+            // search_fts kept its own copy of every document's text (37 MB);
+            // it becomes an index only (contentless, rows deleted by id), and
+            // `search_rows` says which file each row is. About 2 s for 33k rows.
+            SQLite.Migration(version: 6, name: "search_fts without its copy of the text") { [unowned self] db in
+                guard v2Ready else { return false }
+                guard SQLite.exec(db, "CREATE TABLE IF NOT EXISTS search_rows (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL)")
+                else { return false }
+                guard SQLite.hasColumn(db, "search_fts", "path") else { return true }   // done already
+                let ok = SQLite.exec(db, "DROP TABLE IF EXISTS search_fts_new")
+                    && SQLite.exec(db, "CREATE VIRTUAL TABLE search_fts_new USING fts5(" + Self.searchColumns + ")")
+                    && SQLite.exec(db, "INSERT OR IGNORE INTO search_rows (path) SELECT path FROM search_fts")
+                    && SQLite.exec(db, """
+                        INSERT INTO search_fts_new (rowid, name, title, headings, text)
+                        SELECT r.id, s.name, s.title, s.headings, s.text FROM search_fts s
+                        JOIN search_rows r ON r.path = s.path
+                        WHERE s.rowid IN (SELECT min(rowid) FROM search_fts GROUP BY path)
+                        """)
+                    && SQLite.exec(db, "DROP TABLE IF EXISTS search_vocab")
+                    && SQLite.exec(db, "DROP TABLE search_fts")
+                    && SQLite.exec(db, "ALTER TABLE search_fts_new RENAME TO search_fts")
+                    && SQLite.exec(db, "CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, 'row')")
+                guard ok else { return false }
+                setMeta("search_fts_layout", Self.contentlessLayout)
+                // The space the copy took is given back once, while the Mac is idle (`vacuumIfPending`).
+                setMeta("vacuum_pending", "1")
+                return true
+            },
         ]
+    }
+
+    /// search_fts's columns as an index only: rows are `search_rows` ids.
+    private static let searchColumns = "name, title, headings, text, content = '', contentless_delete = 1, "
+        + "tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3'"
+    private static let contentlessLayout = "contentless:name,title,headings,text"
+
+    /// search_fts holds no text (migration 6): rows by `search_rows` id.
+    /// False on the old layout, which keeps working if that migration fails.
+    private var contentless = false
+
+    /// The search_fts row id for a path, made if new.
+    private func searchRow(for path: String, create: Bool) -> Int64? {
+        guard let database else { return nil }
+        if create {
+            var insert: OpaquePointer?
+            defer { sqlite3_finalize(insert) }
+            if sqlite3_prepare_v2(database, "INSERT OR IGNORE INTO search_rows (path) VALUES (?)", -1, &insert, nil) == SQLITE_OK {
+                SQLite.bind(insert, 1, path)
+                sqlite3_step(insert)
+            }
+        }
+        var select: OpaquePointer?
+        defer { sqlite3_finalize(select) }
+        guard sqlite3_prepare_v2(database, "SELECT id FROM search_rows WHERE path = ?", -1, &select, nil) == SQLITE_OK
+        else { return nil }
+        SQLite.bind(select, 1, path)
+        return sqlite3_step(select) == SQLITE_ROW ? sqlite3_column_int64(select, 0) : nil
+    }
+
+    /// Gives back the space a migration freed, once, when the Mac is idle
+    /// (VACUUM rewrites the whole file: seconds, never at launch).
+    func vacuumIfPending() {
+        open()
+        guard ready, let database, metaValue("vacuum_pending") == "1" else { return }
+        let before = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        SQLite.exec(database, "PRAGMA wal_checkpoint(TRUNCATE)")
+        guard SQLite.exec(database, "VACUUM") else {
+            ActivityLog.write(.error, "content.db: vacuum failed — \(String(cString: sqlite3_errmsg(database)))")
+            return
+        }
+        setMeta("vacuum_pending", "0")
+        let after = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        ActivityLog.write(.search, String(format: "content.db: vacuumed, %.1f MB → %.1f MB",
+                                          Double(before) / 1_048_576, Double(after) / 1_048_576))
     }
 
     /// Whether the v2 index holds every stored document yet (`migrateStep`).
@@ -247,7 +320,8 @@ actor ContentStore {
         // the stored documents by the normal migration.
         SQLite.exec(database, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         let layout = "name,title,headings,text"
-        if metaValue("search_fts_layout") != layout {
+        let stored = metaValue("search_fts_layout")
+        if stored != layout && stored != Self.contentlessLayout {
             SQLite.exec(database, "DROP TABLE IF EXISTS search_fts")
             setMeta("v2_copied", "0")
             setMeta("v2_migrated_upto", "0")
@@ -318,12 +392,23 @@ actor ContentStore {
     private func indexV2(path: String, title: String?, headings: String? = nil, text: String) {
         guard v2Ready, let database else { return }
         let name = Self.searchableName(path)
-        deleteV2(path: path)
+        deleteV2(path: path, keepRow: true)
         var insert: OpaquePointer?
         defer { sqlite3_finalize(insert) }
-        if sqlite3_prepare_v2(database,
-                              "INSERT INTO search_fts (name, title, headings, text, path) VALUES (?, ?, ?, ?, ?)",
-                              -1, &insert, nil) == SQLITE_OK {
+        if contentless {
+            if let row = searchRow(for: path, create: true),
+               sqlite3_prepare_v2(database, "INSERT INTO search_fts (rowid, name, title, headings, text) VALUES (?, ?, ?, ?, ?)",
+                                  -1, &insert, nil) == SQLITE_OK {
+                sqlite3_bind_int64(insert, 1, row)
+                SQLite.bind(insert, 2, name)
+                SQLite.bind(insert, 3, title ?? "")
+                SQLite.bind(insert, 4, headings ?? "")
+                SQLite.bind(insert, 5, text)
+                sqlite3_step(insert)
+            }
+        } else if sqlite3_prepare_v2(database,
+                                     "INSERT INTO search_fts (name, title, headings, text, path) VALUES (?, ?, ?, ?, ?)",
+                                     -1, &insert, nil) == SQLITE_OK {
             SQLite.bind(insert, 1, name)
             SQLite.bind(insert, 2, title ?? "")
             SQLite.bind(insert, 3, headings ?? "")
@@ -341,9 +426,14 @@ actor ContentStore {
         }
     }
 
-    private func deleteV2(path: String) {
+    /// `keepRow`: indexed again at once (same `search_rows` id).
+    private func deleteV2(path: String, keepRow: Bool = false) {
         guard v2Ready, let database else { return }
-        for table in ["search_fts", "names_trigram"] {
+        if contentless, let row = searchRow(for: path, create: false) {
+            SQLite.exec(database, "DELETE FROM search_fts WHERE rowid = \(row)")
+            if !keepRow { SQLite.exec(database, "DELETE FROM search_rows WHERE id = \(row)") }
+        }
+        for table in contentless ? ["names_trigram"] : ["search_fts", "names_trigram"] {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             guard sqlite3_prepare_v2(database, "DELETE FROM \(table) WHERE path = ?",
@@ -547,9 +637,17 @@ actor ContentStore {
         // docs fill the limit before the paper. Extensions come from
         // `QueryParse`'s map — letters and digits only.
         let formats = extensions.map { $0.filter { $0.isLetter || $0.isNumber } }.filter { !$0.isEmpty }
+        let pathColumn = contentless ? "r.path" : "path"
         let scoped = formats.isEmpty ? ""
-            : " AND (" + formats.map { "lower(path) LIKE '%.\($0)'" }.joined(separator: " OR ") + ")"
-        let ranked = """
+            : " AND (" + formats.map { "lower(\(pathColumn)) LIKE '%.\($0)'" }.joined(separator: " OR ") + ")"
+        // Contentless: the path from `search_rows`, the title from `documents`.
+        let ranked = contentless ? """
+            SELECT r.path, d.title, bm25(search_fts, 0.0, 6.0, 4.0, 1.0)
+            FROM search_fts JOIN search_rows r ON r.id = search_fts.rowid
+            LEFT JOIN documents d ON d.path = r.path
+            WHERE search_fts MATCH ?\(scoped)
+            ORDER BY bm25(search_fts, 0.0, 6.0, 4.0, 1.0) LIMIT ?
+            """ : """
             SELECT path, title, bm25(search_fts, 0.0, 6.0, 4.0, 1.0)
             FROM search_fts WHERE search_fts MATCH ?\(scoped)
             ORDER BY bm25(search_fts, 0.0, 6.0, 4.0, 1.0) LIMIT ?
@@ -1361,11 +1459,20 @@ actor ContentStore {
         guard ready else { return }
         let overflow = "SELECT id FROM documents WHERE NOT \(Self.imageSQL) "
             + "ORDER BY read_at DESC LIMIT -1 OFFSET \(keep)"
+        // Pruned documents fall back to name-only in the v2 index.
+        var pruned: [String] = []
+        if contentless {
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(database, "SELECT path FROM documents WHERE id IN (\(overflow))", -1, &statement, nil) == SQLITE_OK {
+                while sqlite3_step(statement) == SQLITE_ROW { if let path = SQLite.string(statement, 0) { pruned.append(path) } }
+            }
+            sqlite3_finalize(statement)
+        }
         SQLite.exec(database, "INSERT OR REPLACE INTO unreadable (path, mtime) "
                     + "SELECT path, mtime FROM documents WHERE id IN (\(overflow))")
         SQLite.exec(database, "DELETE FROM documents WHERE id IN (\(overflow))")
-        // Pruned documents fall back to name-only in the v2 index.
-        if v2Ready {
+        for path in pruned { indexV2(path: path, title: nil, text: "") }
+        if v2Ready, !contentless {
             SQLite.exec(database, """
                 UPDATE search_fts SET text = '', title = ''
                 WHERE text != '' AND path NOT IN (SELECT path FROM documents)
