@@ -1,0 +1,31 @@
+.DS_Store
+__pycache__/
+*.pyc
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Local build products used by Scripts/install.sh
+.build/
+
+# Scratch output
+brag-output/
+
+# R session history
+.Rhistory
+
+# Personal: notes, mockups, branding and the private git history (Docs/.git)
+Docs/
+
+# Notes for Claude Code (kept on this Mac only)
+CLAUDE.md
+
+# Claude Code skills (third-party, local only)
+.claude/
+
+# Built app (attach to a GitHub Release instead)
+*.dmg
+
+# Keeps Spotlight out of this folder (local only)
+.metadata_never_index

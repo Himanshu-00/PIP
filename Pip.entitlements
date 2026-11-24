@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened Runtime: the microphone, only while you talk to Pip (talk key). -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<!-- Hardened Runtime: Apple Events, for asking Music and Spotify what's playing and Pip's Mac settings. -->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>
