@@ -348,6 +348,9 @@ struct PipView: View {
                 ForEach(live.prefix(NotchState.pipMaxResults), id: \.self) { url in
                     ResultRow(url: url, onOpen: onOpen)
                 }
+                if live.count > NotchState.pipMaxResults {
+                    ShowAllRow(count: live.count) { search.showAll(for: search.query) }
+                }
             }
         } else if !showsThinking, !agent.found.isEmpty {
             VStack(spacing: 0) {
@@ -357,6 +360,11 @@ struct PipView: View {
                         GroupHeader(name: group)
                     }
                     ResultRow(url: url, onOpen: onOpen)
+                }
+                // Every result, weaker ones too, in the full search panel —
+                // only for a list a search made.
+                if agent.found.count > NotchState.pipMaxResults, let query = agent.foundQuery {
+                    ShowAllRow(count: agent.found.count) { search.showAll(for: query) }
                 }
             }
         }
@@ -890,5 +898,34 @@ private struct SuggestionChip: View {
         .fixedSize()
         .overlay(ClickableArea(onClick: action, onHover: { hovering = $0 }))
         .animation(.spring(response: 0.25, dampingFraction: 0.9), value: hovering)
+    }
+}
+
+/// "Show all 12 in Search": every result, weaker ones too, in the full
+/// panel. Same height and card as a result row, quieter text.
+private struct ShowAllRow: View {
+
+    let count: Int
+    var action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("Show all \(count) in Search")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(PipView.secondaryText)
+            Image(systemName: "arrow.up.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(PipView.secondaryText.opacity(0.8))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: NotchState.pipResultHeight - 3)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .fill(Color.white.opacity(hovering ? 0.10 : 0.0)))
+        .frame(height: NotchState.pipResultHeight)
+        .overlay(ClickableArea(onClick: action, onHover: { hovering = $0 }))
+        .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }
