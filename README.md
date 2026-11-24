@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="Screenshots/icon.png" width="128" alt="Pip's icon: a glowing glass bubble with two eyes">
-
 # Pip
 
 **An AI that lives in your MacBook notch and knows your files.**<br>
@@ -11,11 +9,8 @@ Fully on-device — nothing you ask, say or keep leaves your Mac.
   <img src="https://img.shields.io/badge/macOS-14%2B-000000?logo=apple&logoColor=white" alt="macOS 14+">
   <img src="https://img.shields.io/badge/Apple%20Silicon-required-333333" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white" alt="Swift and SwiftUI">
-  <img src="https://img.shields.io/badge/LLM-MLX%20·%20Qwen3.5--9B-7B61FF" alt="MLX, Qwen3.5-9B">
   <img src="https://img.shields.io/badge/licence-MIT-2EA44F" alt="MIT licence">
 </p>
-
-<img src="Screenshots/pip-idle.png" width="520" alt="Pip, a glass bubble with two eyes, in the open notch above his search bar">
 
 [Files](#-finds-anything-understands-everything) ·
 [Ask](#-ask-him-anything) ·
@@ -56,57 +51,25 @@ Ask by typing or by voice. He answers in his own voice, with clear layouts for e
 
 ## 📂 Finds anything, understands everything
 
-<table>
-<tr>
-<td width="55%"><img src="Screenshots/pip-papers-grouped.png" alt="Asked to find all research papers, Pip lists them under a Papers header, each with his one-line description"></td>
-<td valign="top">
-
 **Every document gets a line in Pip's own words** — *"RLHF paper on summarizing from feedback"*, *"Week 7 slides on research methods"* — from its text, name, folder and neighbours.
 
 That line is searchable, shows under each result, and groups results by kind: **Papers**, **Slides**, **Receipts**… named by Pip, not hardcoded.
-
-</td>
-</tr>
-</table>
 
 - **Ask in your own words** — *"paper about attn"*, *"the rent receipt from March"*, *"slides I downloaded last week"*. Typos, abbreviations, dates and folders all work.
 - **Answers from inside files** — *"how much rent did I pay last month?"* is read from the documents themselves.
 - **Keeps things tidy** — move, copy, rename, find duplicates, suggest better names, and organise a folder into folders named after what's in them. Everything can be undone.
 
-<div align="center">
-<img src="Screenshots/pip-find-attn.png" width="620" alt="Pip answering Can you find me paper about attn? with the Attention Is All You Need paper first">
-</div>
-
 ---
 
 ## 💬 Ask him anything
 
-<div align="center">
-<table>
-<tr>
-<td align="center"><img src="Screenshots/pip-listening.png" width="200" alt="Pip listening"><br><sub><b>Listening</b> · ⌥V</sub></td>
-<td align="center"><img src="Screenshots/pip-thinking.png" width="200" alt="Pip thinking, with an aurora inside him"><br><sub><b>Thinking</b></sub></td>
-<td align="center"><img src="Screenshots/pip-searching-web.png" width="250" alt="Pip searching the web"><br><sub><b>Searching the web</b></sub></td>
-</tr>
-</table>
-</div>
-
-Questions, facts and conversions go through a web search first, so answers are current — laid out as a headline, a paragraph and points, with pictures when they help.
-
-<div align="center">
-<img src="Screenshots/pip-web.png" width="480" alt="Pip explaining why the sky is blue: a headline, numbered points and a From the web chip">
-<img src="Screenshots/pip-pictures.png" width="340" alt="Ten pictures of the northern lights in two rows">
-</div>
+Ask by typing, or press <kbd>⌥</kbd> <kbd>V</kbd> and talk. Questions, facts and conversions go through a web search first, so answers are current — laid out as a headline, a paragraph and points, with pictures when they help.
 
 Plus the everyday jobs: volume, apps, music, timers, notes, screenshots, and summarising long text you copy. **Click to ask** (⌥⇧A) explains any picture or text on screen in a panel beside it.
 
 ---
 
 ## 🏝️ The island
-
-<div align="center">
-<img src="Screenshots/island-panel.png" width="760" alt="The island opened on hover: a search bar, a now-playing chip and recent screenshots">
-</div>
 
 Hover the notch for search, now playing, and your recent screenshots. The island also shows charging and low battery, finished downloads (with an offer to rename or file them), and a shelf to park files on and drag out later.
 
