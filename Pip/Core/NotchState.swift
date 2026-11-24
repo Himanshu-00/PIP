@@ -452,8 +452,7 @@ final class NotchState: ObservableObject {
     /// About 238 in the greeting, 194 thinking or replying (spec section 2).
     var pipSize: CGSize {
         var height = pipTopInset + pipTopRowHeight
-        // One more row for "Show all N in Search" when there are more.
-        let results = pipThinking ? 0 : min(pipResults, Self.pipMaxResults + (pipResults > Self.pipMaxResults ? 1 : 0))
+        let results = pipThinking ? 0 : min(pipResults, Self.pipMaxResults)
         if results > 0 {
             height += Self.pipRowGap + CGFloat(results) * Self.pipResultHeight
                 + CGFloat(min(pipResultHeaders, Self.pipMaxGroupHeaders)) * Self.pipGroupHeaderHeight
@@ -523,7 +522,7 @@ final class NotchState: ObservableObject {
                     + Self.pipCardPadTop + CGFloat(Self.pipReplyMaxLines) * Self.pipReplyLineHeight + Self.pipCardPadBottom,
                   Self.pipOrbSmall + Self.pipAnswerGap + PipExplanation.maxHeight)
             + Self.pipRowGap + Self.pipAnswerActionsHeight
-            + Self.pipRowGap + CGFloat(Self.pipMaxResults + 1) * Self.pipResultHeight
+            + Self.pipRowGap + CGFloat(Self.pipMaxResults) * Self.pipResultHeight
             + CGFloat(Self.pipMaxGroupHeaders) * Self.pipGroupHeaderHeight
             + Self.pipRowGap + Self.pipPicturesHeight(rows: Self.pipMaxPictureRows,
                                                       width: Self.pipLongWidth - Self.pipSideInset * 2)

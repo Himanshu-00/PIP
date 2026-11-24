@@ -34,6 +34,8 @@ struct Candidate: Identifiable, Equatable, Sendable {
     /// (or a phrase/"every word" hit from the index or Spotlight). Strict
     /// matching puts these above everything else.
     var matchesAll = false
+    /// Every word, close together in its text (`ContentStore.Hit.near`).
+    var wordsNear = false
     /// How much the picture looks like the query (photo vectors), 0…1; 0 =
     /// not found by looks.
     var looks = 0.0
@@ -41,10 +43,9 @@ struct Candidate: Identifiable, Equatable, Sendable {
     /// raise `textMatch` above it, never below.
     var indexedTextMatch = 0.0
 
-    var isImage: Bool {
-        ["png", "jpg", "jpeg", "heic", "gif", "tiff", "bmp", "webp"]
-            .contains(url.pathExtension.lowercased())
-    }
+    static let imageKinds: Set<String> = ["png", "jpg", "jpeg", "heic", "gif", "tiff", "bmp", "webp"]
+
+    var isImage: Bool { Self.imageKinds.contains(url.pathExtension.lowercased()) }
 
     var isPDF: Bool { url.pathExtension.lowercased() == "pdf" }
 

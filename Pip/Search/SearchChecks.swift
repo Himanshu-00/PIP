@@ -12,18 +12,23 @@ enum SearchChecks {
         let query: String
         /// Parts of accepted files' paths — any one counts.
         let expect: [String]
+        /// "List all" checks: every one of these should be in Pip's list (path parts).
+        let every: [String]
         let note: String?
 
-        private enum Keys: String, CodingKey { case query, expect, note }
+        private enum Keys: String, CodingKey { case query, expect, every, note }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: Keys.self)
             query = try container.decode(String.self, forKey: .query)
             note = try container.decodeIfPresent(String.self, forKey: .note)
+            every = try container.decodeIfPresent([String].self, forKey: .every) ?? []
             if let many = try? container.decode([String].self, forKey: .expect) {
                 expect = many
+            } else if let one = try? container.decode(String.self, forKey: .expect) {
+                expect = [one]
             } else {
-                expect = [try container.decode(String.self, forKey: .expect)]
+                expect = every
             }
         }
     }
@@ -42,6 +47,12 @@ enum SearchChecks {
     private static let home = NSHomeDirectory()
 
     private static func short(_ path: String) -> String { path.replacingOccurrences(of: home, with: "~") }
+
+    /// Just the hand set (`--args -searchChecks YES`), one log line per check.
+    static func runHandSet() async {
+        await handSet()
+        await SearchLog.shared.discardPending()
+    }
 
     static func run() async {
         await handSet()
@@ -108,6 +119,7 @@ enum SearchChecks {
         }
         var engineRanks: [Int?] = []
         var pipRanks: [Int?] = []
+        var everyFound = 0, everyWanted = 0
         for check in checks {
             let results = await ranked(check.query)
             let engine = Array(results.prefix(12)).map(\.url)
@@ -128,10 +140,20 @@ enum SearchChecks {
             engineRanks.append(rank(engine))
             pipRanks.append(rank(pip))
             let shown = { (r: Int?) in r.map(String.init) ?? "missing" }
+            if !check.every.isEmpty {
+                let missing = check.every.filter { part in !pip.contains { $0.path.contains(part) } }
+                let wrong = pip.filter { url in !check.every.contains { url.path.contains($0) } }
+                everyFound += check.every.count - missing.count
+                everyWanted += check.every.count
+                ActivityLog.write(.search, "list check \"\(check.query)\" → \(check.every.count - missing.count)/\(check.every.count) in Pip's \(pip.count)"
+                                  + (missing.isEmpty ? "" : " — missing: " + missing.joined(separator: ", "))
+                                  + (wrong.isEmpty ? "" : " — others: " + wrong.prefix(6).map(\.lastPathComponent).joined(separator: ", ")))
+            }
             ActivityLog.write(.search, "search check \"\(check.query)\" → rank \(shown(engineRanks.last!)) (pip \(shown(pipRanks.last!)))"
                               + " — top: " + engine.prefix(3).map { short($0.path) }.joined(separator: ", "))
         }
-        ActivityLog.write(.search, "checks: \(summary(engineRanks)) (pip: \(summary(pipRanks)))")
+        ActivityLog.write(.search, "checks: \(summary(engineRanks)) (pip: \(summary(pipRanks)))"
+                          + (everyWanted == 0 ? "" : ", lists \(everyFound)/\(everyWanted)"))
     }
 
     /// Photo picks only (replay + hand set): the photo vectors alone versus

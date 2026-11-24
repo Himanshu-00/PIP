@@ -53,8 +53,9 @@ enum PetTools {
               "label": string("Optional: what it's for, e.g. tea")],
              required: ["action"]),
         tool("collect_files",
-             "Put ALL files matching a search into one folder (made if needed): copies by default, or moves. "
-             + "Use for 'put all my X into a folder'. Shows the files and asks the user once.",
+             "Copy or move every file matching a search into one folder (made if needed). Only when the user "
+             + "asks to put, copy, move or gather files into a folder — never to list, show or find them "
+             + "(that's find_files). Shows the files and asks the user once.",
              ["query": string("Which files, e.g. 'rent receipts' or 'visa documents pdf'"),
               "folder": string("Folder name, e.g. Rent History, or a path"),
               "mode": choice(["copy", "move"], "copy keeps the originals where they are (default)"),
@@ -106,7 +107,9 @@ enum PetTools {
 
     private static let baseSchemas: [[String: Any]] = [
         tool("find_files",
-             "Search the user's files by name or by what is inside them. Returns up to 5 matches with their full paths.",
+             "Search the user's files by name or by what is inside them, or by what kind of file they are. "
+             + "Use for find, list and show — 'list all my research papers' too. Returns the best matches with "
+             + "their full paths; the rest are on screen.",
              ["query": string("What to look for, e.g. 'applied task 4' or 'rent invoice'")],
              required: ["query"]),
         tool("open_file",
@@ -201,7 +204,7 @@ enum FileFinder {
 
     /// Words a request wraps around the name ("open the file called…", "the
     /// attention paper"). Kind words are filters, in `QueryParse`.
-    private static let filler: Set<String> = QueryParse.chatWords.union(["paper", "papers", "article"])
+    private static let filler: Set<String> = QueryParse.chatWords
 
     /// The extensions a type word names, plurals included ("pictures").
     private static func kindExtensions(_ word: String) -> Set<String>? {
@@ -602,22 +605,21 @@ enum FileFinder {
     /// then a kind filter; the older finder if nothing fits.
     static func find(_ query: String, limit: Int = 5) async -> [URL] {
         // Five, or more when more are as good: past five, a file is kept
-        // while it scores within 80% of the best, up to twelve.
+        // while it scores within 80% of the best, or Pip described it as the
+        // kind asked for ("list all my papers"), up to twelve.
         let all = Tokens.of(query).filter { !filler.contains($0) }
         guard !all.isEmpty else { return [] }
         var wanted = Set<String>()
         for word in all {
             if let extensions = kindExtensions(word) { wanted.formUnion(extensions) }
         }
-        // Kind words stay in the text, and so do "paper" and "article": the
-        // engine treats them as hints about the kind of file.
-        let hints: Set<String> = ["paper", "papers", "article"]
+        // Kind words stay in the text: the engine treats them as hints about the kind of file.
         // A file name ("photo.jpg") goes to the engine as typed: split into
         // "profile jpg" it lost the dot, and with it the name — Pip got
         // screenshots that happened to be JPGs.
         let named = query.range(of: #"[\w-]\.[A-Za-z0-9]{2,5}\b"#, options: .regularExpression) != nil
         let text = named ? query.trimmingCharacters(in: .whitespaces)
-                         : Tokens.of(query).filter { !filler.contains($0) || hints.contains($0) }.joined(separator: " ")
+                         : Tokens.of(query).filter { !filler.contains($0) }.joined(separator: " ")
         let ranked = await SearchController.forPip.find(text, timeHint: query)
         var fitting = ranked.filter { candidate in
             (wanted.isEmpty || wanted.contains(candidate.url.pathExtension.lowercased()))
@@ -638,10 +640,29 @@ enum FileFinder {
             }
         }
         var chosen = Array(fitting.prefix(limit))
+        let urls = fitting.map(\.url)
+        let askedKind = await MainActor.run { Set(urls.filter { SearchController.forPip.isAskedKind($0) }) }
+        let offKind = await MainActor.run { Set(urls.filter { !SearchController.forPip.fitsAskedKind($0) }) }
         if chosen.count == limit, let best = fitting.first?.score, best > 0 {
             for candidate in fitting.dropFirst(limit).prefix(SearchController.extendedShortlist - limit)
             where candidate.score >= best * 0.8 {
                 chosen.append(candidate)
+            }
+            // Pip described it as the kind asked for: in the list wherever it
+            // ranked (a paper whose text barely says "research" came 13th).
+            for candidate in fitting.dropFirst(limit) where chosen.count < SearchController.extendedShortlist
+                && askedKind.contains(candidate.url) && !chosen.contains(where: { $0.url == candidate.url }) {
+                chosen.append(candidate)
+            }
+            // A kind of file was asked for ("rent receipts"): a list, so every
+            // file holding all the words too — photographed receipts score
+            // below the described ones, but they're receipts.
+            if !askedKind.isEmpty, fitting.first?.matchesAll == true {
+                for candidate in fitting.dropFirst(limit) where chosen.count < SearchController.extendedShortlist
+                    && candidate.matchesAll && !offKind.contains(candidate.url)
+                    && !chosen.contains(where: { $0.url == candidate.url }) {
+                    chosen.append(candidate)
+                }
             }
         }
         if !chosen.isEmpty {

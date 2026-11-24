@@ -348,9 +348,6 @@ struct PipView: View {
                 ForEach(live.prefix(NotchState.pipMaxResults), id: \.self) { url in
                     ResultRow(url: url, onOpen: onOpen)
                 }
-                if live.count > NotchState.pipMaxResults {
-                    ShowAllRow(count: live.count) { search.showAll(for: search.query) }
-                }
             }
         } else if !showsThinking, !agent.found.isEmpty {
             VStack(spacing: 0) {
@@ -360,17 +357,6 @@ struct PipView: View {
                         GroupHeader(name: group)
                     }
                     ResultRow(url: url, onOpen: onOpen)
-                }
-                if agent.found.count > NotchState.pipMaxResults {
-                    ShowAllRow(count: agent.found.count, inFinder: agent.foundQuery == nil) {
-                        // The search that found these — or, for a list that
-                        // didn't come from a search, the files themselves.
-                        if let query = agent.foundQuery {
-                            search.showAll(for: query)
-                        } else {
-                            NSWorkspace.shared.activateFileViewerSelecting(agent.found)
-                        }
-                    }
                 }
             }
         }
@@ -810,36 +796,6 @@ private struct AnswerChip: View {
                 showsDone = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { showsDone = false }
             }, onHover: { hovering = $0 }))
-    }
-}
-
-/// "Show all 12 in Search": the rest of what Pip found, in the full panel.
-/// Same height and card as a result row, quieter text.
-private struct ShowAllRow: View {
-
-    let count: Int
-    var inFinder = false
-    var action: () -> Void
-
-    @State private var hovering = false
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Text("Show all \(count) in \(inFinder ? "Finder" : "Search")")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(PipView.secondaryText)
-            Image(systemName: "arrow.up.right")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(PipView.secondaryText.opacity(0.8))
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .frame(height: NotchState.pipResultHeight - 3)
-        .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
-            .fill(Color.white.opacity(hovering ? 0.10 : 0.0)))
-        .frame(height: NotchState.pipResultHeight)
-        .overlay(ClickableArea(onClick: action, onHover: { hovering = $0 }))
-        .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }
 

@@ -30,6 +30,9 @@ actor ContentStore {
         var phrase = false
         /// Every query word appears somewhere in its title, headings or text.
         var allWords = false
+        /// …and close together (within a dozen words): a caption or sentence
+        /// about them, not a huge file where each turns up somewhere.
+        var near = false
     }
 
     private var database: OpaquePointer?
@@ -82,6 +85,13 @@ actor ContentStore {
         // A document's one-line description from Pip's brain (`DocumentNotes`):
         // what kind of file it is and what it's about, in the model's own words.
         SQLite.exec(database, "ALTER TABLE documents ADD COLUMN about TEXT")
+        // The kind of file it is ("research paper", "rent receipt"), as Pip
+        // files it — so a search for a kind goes straight to its group.
+        // `kind_by`: 'pip' (his brain said so) or 'line' (read from his
+        // description until he looks again, `DocumentNotes`).
+        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN kind TEXT")
+        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN kind_by TEXT")
+        SQLite.exec(database, "CREATE INDEX IF NOT EXISTS documents_kind ON documents(kind)")
         v2Ready = createSchemaV2()
         if v2Ready { runOneTimeFixes() }
         SQLite.excludeFromBackup(location)
@@ -235,6 +245,9 @@ actor ContentStore {
             )
             """,
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
+            // Every word the index holds and how many files hold it — what a
+            // typo is corrected against (`correction`).
+            "CREATE VIRTUAL TABLE IF NOT EXISTS search_vocab USING fts5vocab(search_fts, 'row')",
         ]
         for statement in statements where !SQLite.exec(database, statement) { return false }
         return true
@@ -470,12 +483,13 @@ actor ContentStore {
 
     /// Search over what documents say (title, headings, text; not the name):
     /// exact phrase first, then any word. Nil until v2 is ready.
-    private func searchV2(words: [String], limit: Int) -> [Hit]? {
+    private func searchV2(words: [String], limit: Int, extensions: Set<String> = []) -> [Hit]? {
         guard v2Ready, SQLite.userVersion(database) >= 2, let database else { return nil }
         var hits: [Hit] = []
         var seen = Set<String>()
 
-        func run(_ sql: String, _ expression: String, phrase: Bool, boost: Double, allWords: Bool = false) {
+        func run(_ sql: String, _ expression: String, phrase: Bool, boost: Double, allWords: Bool = false,
+                 near: Bool = false) {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return }
@@ -488,33 +502,49 @@ actor ContentStore {
                 hits.append(Hit(url: URL(fileURLWithPath: path),
                                 title: (title?.isEmpty ?? true) ? nil : title,
                                 score: -sqlite3_column_double(statement, 2) + boost,
-                                phrase: phrase, allWords: phrase || allWords))
+                                phrase: phrase, allWords: phrase || allWords, near: phrase || near))
             }
         }
+        // "pdf about transformers": only that format, or a thousand code
+        // docs fill the limit before the paper. Extensions come from
+        // `QueryParse`'s map — letters and digits only.
+        let formats = extensions.map { $0.filter { $0.isLetter || $0.isNumber } }.filter { !$0.isEmpty }
+        let scoped = formats.isEmpty ? ""
+            : " AND (" + formats.map { "lower(path) LIKE '%.\($0)'" }.joined(separator: " OR ") + ")"
         let ranked = """
             SELECT path, title, bm25(search_fts, 0.0, 6.0, 4.0, 1.0)
-            FROM search_fts WHERE search_fts MATCH ?
+            FROM search_fts WHERE search_fts MATCH ?\(scoped)
             ORDER BY bm25(search_fts, 0.0, 6.0, 4.0, 1.0) LIMIT ?
             """
         let cleaned = words.map { $0.filter { $0.isLetter || $0.isNumber } }.filter { !$0.isEmpty }
         guard !cleaned.isEmpty else { return [] }
 
         let content = "{title headings text} : "
+        // Each word as a prefix (it arrives stemmed), and "snowy" as "snow" too.
+        func term(_ word: String) -> String {
+            Tokens.plainForm(word).map { "(\"\(word)\"* OR \"\($0)\")" } ?? "\"\(word)\"*"
+        }
         // 1. The words together, in order — a strong sign.
         if cleaned.count >= 2 {
             run(ranked, content + "\"" + cleaned.joined(separator: " ") + "\"", phrase: true, boost: 50)
         }
-        // 2. Every word, anywhere in the document — the paper says "attention",
+        // 2. Every word, close together — a caption ("headphones, microphone,
+        // studio") over a 5 MB word list that holds each somewhere.
+        if cleaned.count >= 2 {
+            let near = "NEAR(" + cleaned.map { "\"\($0)\"*" }.joined(separator: " ") + ", 12)"
+            run(ranked, content + near, phrase: false, boost: 35, allWords: true, near: true)
+        }
+        // 3. Every word, anywhere in the document — the paper says "attention",
         // "all", "you" and "need"; a file of attention code mostly says one of
         // them, many times, which is all an any-word match can see.
         if cleaned.count >= 2 {
             // Prefix terms: query words arrive stemmed ("augment"), and the
             // prefix is what finds "augmented" and "augmentations".
-            let every = cleaned.map { "\"\($0)\"*" }.joined(separator: " AND ")
+            let every = cleaned.map(term).joined(separator: " AND ")
             run(ranked, content + "(" + every + ")", phrase: false, boost: 25, allWords: true)
         }
         // Any of the words, each a prefix (half-typed or a stem).
-        let terms = cleaned.map { "\"\($0)\"*" }
+        let terms = cleaned.map(term)
         run(ranked, content + "(" + terms.joined(separator: " OR ") + ")", phrase: false, boost: 0,
             allWords: cleaned.count == 1)
         return Array(hits.prefix(limit))
@@ -712,7 +742,7 @@ actor ContentStore {
     /// Saves a description and puts it at the front of the document's
     /// searchable text. Returns the new text (for the meaning index), or nil
     /// if the file changed or went away meanwhile.
-    func setAbout(path: String, modified: Date, about: String) -> (title: String?, text: String)? {
+    func setAbout(path: String, modified: Date, about: String, kind: String?) -> (title: String?, text: String)? {
         open()
         guard ready, let database else { return nil }
         var read: OpaquePointer?
@@ -731,11 +761,16 @@ actor ContentStore {
         if !about.isEmpty { text = Self.aboutLine(about) + text }
         var write: OpaquePointer?
         defer { sqlite3_finalize(write) }
-        guard sqlite3_prepare_v2(database, "UPDATE documents SET about = ?, text = ? WHERE path = ?",
+        guard sqlite3_prepare_v2(database, "UPDATE documents SET about = ?, text = ?, kind = ?, kind_by = ? WHERE path = ?",
                                  -1, &write, nil) == SQLITE_OK else { return nil }
         SQLite.bind(write, 1, about)
         SQLite.bind(write, 2, text)
-        SQLite.bind(write, 3, path)
+        if let kind, !kind.isEmpty {
+            SQLite.bind(write, 3, kind); SQLite.bind(write, 4, "pip")
+        } else {
+            sqlite3_bind_null(write, 3); sqlite3_bind_null(write, 4)
+        }
+        SQLite.bind(write, 5, path)
         sqlite3_step(write)
         indexV2(path: path, title: title, headings: headings, text: text)
         return (title, text)
@@ -745,6 +780,8 @@ actor ContentStore {
     /// Pip's description, its own title, a photo's caption, the start of its text.
     struct Note: Sendable {
         var about: String?
+        /// The kind Pip filed it under ("research paper"), normalised (`Kinds`).
+        var kind: String?
         var title: String?
         var caption: String?
         var opening: String
@@ -756,7 +793,7 @@ actor ContentStore {
         var out: [String: Note] = [:]
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(database, "SELECT about, title, caption, substr(text, 1, 400) FROM documents WHERE path = ?",
+        guard sqlite3_prepare_v2(database, "SELECT about, title, caption, substr(text, 1, 400), kind FROM documents WHERE path = ?",
                                  -1, &statement, nil) == SQLITE_OK else { return [:] }
         for path in paths {
             sqlite3_reset(statement)
@@ -767,6 +804,7 @@ actor ContentStore {
                 if let end = opening.firstIndex(of: "\n") { opening = String(opening[opening.index(after: end)...]) }
             }
             out[path] = Note(about: SQLite.string(statement, 0).flatMap { $0.isEmpty ? nil : $0 },
+                             kind: SQLite.string(statement, 4).flatMap { $0.isEmpty ? nil : $0 },
                              title: SQLite.string(statement, 1), caption: SQLite.string(statement, 2),
                              opening: opening)
         }
@@ -939,6 +977,180 @@ actor ContentStore {
     }
 
     /// Everything read that matches, ranked by BM25.
+    /// Only files of these formats (v2 index only; empty = any).
+    func search(words: [String], limit: Int = 60, extensions: Set<String>) -> [Hit] {
+        open()
+        guard ready, !words.isEmpty else { return [] }
+        return searchV2(words: words, limit: limit, extensions: extensions) ?? []
+    }
+
+    /// Every document filed under this kind: the exact kind ("research
+    /// paper"), or any kind ending in its head ("exam paper" for "paper").
+    func documents(ofKind head: String, limit: Int = 400) -> [(path: String, kind: String)] {
+        open()
+        guard ready, let database, !head.isEmpty else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "SELECT path, kind FROM documents WHERE kind = ? OR kind LIKE ? LIMIT ?",
+                                 -1, &statement, nil) == SQLITE_OK else { return [] }
+        SQLite.bind(statement, 1, head)
+        SQLite.bind(statement, 2, "% " + head)
+        sqlite3_bind_int(statement, 3, Int32(limit))
+        var out: [(String, String)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let path = SQLite.string(statement, 0), let kind = SQLite.string(statement, 1) { out.append((path, kind)) }
+        }
+        return out
+    }
+
+    /// Descriptions with no kind yet (written before kinds were stored).
+    func describedWithoutKind(limit: Int = 5_000) -> [(path: String, about: String)] {
+        open()
+        guard ready, let database else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "SELECT path, about FROM documents WHERE about != '' AND kind IS NULL LIMIT ?",
+                                 -1, &statement, nil) == SQLITE_OK else { return [] }
+        sqlite3_bind_int(statement, 1, Int32(limit))
+        var out: [(String, String)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let path = SQLite.string(statement, 0), let about = SQLite.string(statement, 1) { out.append((path, about)) }
+        }
+        return out
+    }
+
+    /// Files a document under a kind. `by`: "pip" or "line".
+    func setKinds(_ kinds: [(path: String, kind: String)], by: String) {
+        open()
+        guard ready, let database, !kinds.isEmpty else { return }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "UPDATE documents SET kind = ?, kind_by = ? WHERE path = ?",
+                                 -1, &statement, nil) == SQLITE_OK else { return }
+        SQLite.exec(database, "BEGIN")
+        for (path, kind) in kinds {
+            sqlite3_reset(statement)
+            SQLite.bind(statement, 1, kind); SQLite.bind(statement, 2, by); SQLite.bind(statement, 3, path)
+            sqlite3_step(statement)
+        }
+        SQLite.exec(database, "COMMIT")
+    }
+
+    /// A document whose kind was only read from its description, for Pip
+    /// to look at again: surfaced ones first, then newest.
+    struct ToRecheck: Sendable {
+        var path: String
+        var about: String
+        var title: String?
+        var opening: String
+    }
+
+    func kindsToRecheck(first: [String], limit: Int) -> [ToRecheck] {
+        open()
+        guard ready, let database else { return [] }
+        var out: [ToRecheck] = []
+        func rows(_ sql: String, bind: (OpaquePointer?) -> Void) {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return }
+            bind(statement)
+            while sqlite3_step(statement) == SQLITE_ROW, out.count < limit {
+                guard let path = SQLite.string(statement, 0), !out.contains(where: { $0.path == path }) else { continue }
+                var opening = SQLite.string(statement, 3) ?? ""
+                if opening.hasPrefix("About: "), let end = opening.firstIndex(of: "\n") {
+                    opening = String(opening[opening.index(after: end)...])
+                }
+                out.append(ToRecheck(path: path, about: SQLite.string(statement, 1) ?? "",
+                                     title: SQLite.string(statement, 2), opening: opening))
+            }
+        }
+        let select = "SELECT path, about, title, substr(text, 1, 700) FROM documents WHERE kind_by = 'line' AND about != ''"
+        for path in first where out.count < limit {
+            rows(select + " AND path = ?") { SQLite.bind($0, 1, path) }
+        }
+        if out.count < limit { rows(select + " ORDER BY mtime DESC LIMIT \(limit * 2)") { _ in } }
+        return out
+    }
+
+    func kindsToRecheckCount() -> Int {
+        open()
+        guard ready, let database else { return 0 }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "SELECT count(*) FROM documents WHERE kind_by = 'line'", -1, &statement, nil) == SQLITE_OK,
+              sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    /// Documents Pip described with any of these words, and his line about
+    /// each — for finding files by the kind he said they are.
+    func described(withAny words: [String], limit: Int = 300) -> [(path: String, about: String)] {
+        open()
+        guard ready, let database else { return [] }
+        let usable = words.map { $0.filter { $0.isLetter } }.filter { $0.count >= 3 }
+        guard !usable.isEmpty else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        let sql = "SELECT path, about FROM documents WHERE about != '' AND ("
+            + usable.map { _ in "lower(about) LIKE ?" }.joined(separator: " OR ") + ") LIMIT ?"
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        for (index, word) in usable.enumerated() { SQLite.bind(statement, Int32(index + 1), "%\(word.lowercased())%") }
+        sqlite3_bind_int(statement, Int32(usable.count + 1), Int32(limit))
+        var out: [(String, String)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let path = SQLite.string(statement, 0), let about = SQLite.string(statement, 1) { out.append((path, about)) }
+        }
+        return out
+    }
+
+    /// The word the index holds that `word` was probably meant to be
+    /// ("netwrk" → "network"), or nil when the word (or a word starting with
+    /// it) is in the index already, or nothing close is. Closest first, then
+    /// the one in most files.
+    func correction(for word: String) -> String? {
+        open()
+        guard v2Ready, let database, word.count >= 4, word.allSatisfy(\.isLetter) else { return nil }
+        func rows(_ sql: String, _ bind: (OpaquePointer?) -> Void) -> [(String, Int)] {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+            bind(statement)
+            var out: [(String, Int)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let term = SQLite.string(statement, 0) { out.append((term, Int(sqlite3_column_int(statement, 1)))) }
+            }
+            return out
+        }
+        let lowered = word.lowercased()
+        // Known already: the word, or one it starts (query words arrive stemmed).
+        let next = String(lowered.dropLast()) + String(UnicodeScalar((lowered.unicodeScalars.last?.value ?? 97) + 1)!)
+        if !rows("SELECT term, doc FROM search_vocab WHERE term >= ? AND term < ? LIMIT 1", {
+            SQLite.bind($0, 1, lowered); SQLite.bind($0, 2, next)
+        }).isEmpty { return nil }
+        // Same first letter, similar length; at most one edit for short words, two for long.
+        let first = String(lowered.prefix(1))
+        let after = String(UnicodeScalar((first.unicodeScalars.first?.value ?? 97) + 1)!)
+        let candidates = rows("""
+            SELECT term, doc FROM search_vocab WHERE term >= ? AND term < ?
+              AND length(term) BETWEEN ? AND ? AND doc >= 2
+            """, {
+            SQLite.bind($0, 1, first); SQLite.bind($0, 2, after)
+            sqlite3_bind_int($0, 3, Int32(lowered.count - 2)); sqlite3_bind_int($0, 4, Int32(lowered.count + 3))
+        })
+        let allowed = lowered.count >= 7 ? 2 : 1
+        var best: (term: String, distance: Int, docs: Int)?
+        for (term, docs) in candidates where term.allSatisfy(\.isLetter) {
+            // A stem matches the start of a word: "retentv" is "retentive" cut short.
+            let distance = min(Fuzzy.editDistance(lowered, term),
+                               Fuzzy.editDistance(lowered, String(term.prefix(lowered.count))))
+            guard distance <= allowed else { continue }
+            if best == nil || distance < best!.distance || (distance == best!.distance && docs > best!.docs) {
+                best = (term, distance, docs)
+            }
+        }
+        return best?.term
+    }
+
     func search(words: [String], limit: Int = 60) -> [Hit] {
         open()
         guard ready, let database, !words.isEmpty else { return [] }
@@ -1045,7 +1257,9 @@ actor ContentStore {
                 read_at = excluded.read_at,
                 headings = excluded.headings,
                 caption = excluded.caption,
-                about = excluded.about
+                about = excluded.about,
+                kind = CASE WHEN excluded.about IS NULL THEN NULL ELSE documents.kind END,
+                kind_by = CASE WHEN excluded.about IS NULL THEN NULL ELSE documents.kind_by END
             """
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return }
         SQLite.bind(statement, 1, path)

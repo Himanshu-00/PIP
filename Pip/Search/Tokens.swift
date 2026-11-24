@@ -49,6 +49,15 @@ enum Tokens {
 
     /// A crude stem for queries ("augmented" → "augment"), always matched as a
     /// prefix. Short words and anything with a digit stay.
+    /// "snowy" → "snow": the plain word an adjective in -y is made from,
+    /// matched exactly (a caption says "snow"). Not a stem: "party" → "part"
+    /// as a prefix would find "partial".
+    static func plainForm(_ word: String) -> String? {
+        guard word.count >= 5, word.hasSuffix("y"), !word.contains(where: \.isNumber),
+              let before = word.dropLast().last, !"aeiouy".contains(before) else { return nil }
+        return String(word.dropLast())
+    }
+
     static func stem(_ word: String) -> String {
         guard !word.contains(where: \.isNumber) else { return word }
         if word.count >= 7, word.hasSuffix("ing") { return String(word.dropLast(3)) }

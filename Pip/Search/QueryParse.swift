@@ -16,6 +16,10 @@ struct QueryParse: CustomStringConvertible {
     let kindWords: [String]
     /// The file extensions asked for; empty means any.
     let extensions: Set<String>
+    /// Formats a genre word prefers ("slides" → pptx, key); never a filter.
+    let preferred: Set<String>
+    /// Formats to score as a type match: the asked ones and the preferred.
+    var typeHints: Set<String> { extensions.union(preferred) }
     let time: QueryTime.Window?
     /// "my pic", "photo of me", "me in…" — recorded, not acted on yet (a
     /// face filter is a later task).
@@ -48,7 +52,14 @@ struct QueryParse: CustomStringConvertible {
         extensions = art ? Self.images
             : kindWords.reduce(into: Set<String>()) { $0.formUnion(Self.extensions(for: $1) ?? []) }
         let pictures = art || kindWords.contains { Self.pictureWords.contains($0) }
-        let asked = all.filter { !Self.chatWords.contains($0) }
+        preferred = all.reduce(into: Set<String>()) { $0.formUnion(Self.genreExtensions(for: $1) ?? []) }
+        // "all research papers", "every receipt": how many, not what. Only
+        // first — "Attention Is All You Need" keeps its "all".
+        let leading = Set(["all", "every", "each"])
+        let asked = all.enumerated().filter { index, word in
+            !Self.chatWords.contains(word)
+                && !(leading.contains(word) && all.prefix(index).allSatisfy(Self.chatWords.contains) && all.count > index + 1)
+        }.map(\.element)
         // Typed like a file name ("data.png"): the extension is part of the
         // name being asked for, as well as its kind.
         let lowered = text.lowercased()
@@ -121,8 +132,6 @@ struct QueryParse: CustomStringConvertible {
         map["doc"] = wordDocs.union(["pages", "rtf", "odt"])
         map["docx"] = wordDocs
         map["word"] = wordDocs
-        map["document"] = ["pdf", "doc", "docx", "pages", "rtf", "txt", "md"]
-        for word in ["slide", "slides", "deck", "presentation"] { map[word] = slides }
         map["powerpoint"] = ["pptx", "ppt"]
         for word in ["sheet", "spreadsheet"] { map[word] = sheets }
         map["excel"] = ["xlsx", "xls"]
@@ -131,6 +140,20 @@ struct QueryParse: CustomStringConvertible {
         for word in ["zip", "archive"] { map[word] = ["zip"] }
         return map
     }()
+
+    /// Kinds of document, not formats: lecture slides are mostly PDFs, and
+    /// "visa documents" are scans. These prefer their formats but never
+    /// filter, and stay words to search — Pip's descriptions name them.
+    static let genres: [String: Set<String>] = {
+        var map: [String: Set<String>] = [:]
+        for word in ["slide", "slides", "deck", "presentation"] { map[word] = slides }
+        map["document"] = ["pdf", "doc", "docx", "pages", "rtf", "txt", "md"]
+        return map
+    }()
+
+    static func genreExtensions(for word: String) -> Set<String>? {
+        genres[word] ?? (word.hasSuffix("s") ? genres[String(word.dropLast())] : nil)
+    }
 
     static func extensions(for word: String) -> Set<String>? {
         kinds[word] ?? (word.hasSuffix("s") ? kinds[String(word.dropLast())] : nil)
@@ -171,7 +194,7 @@ struct QueryParse: CustomStringConvertible {
     /// Words that describe a file rather than say what's in it: searched
     /// for, never required.
     static let describing: Set<String> = [
-        "paper", "papers", "article", "today", "yesterday", "last", "this", "week", "weeks",
+        "paper", "papers", "article", "slide", "slides", "deck", "presentation", "document", "documents", "today", "yesterday", "last", "this", "week", "weeks",
         "month", "months", "year", "years", "ago", "day", "days", "recent", "recently",
         "latest", "newest", "new", "old", "older",
     ]

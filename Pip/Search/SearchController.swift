@@ -213,7 +213,7 @@ final class SearchController: ObservableObject {
             var candidate = Candidate(url: url, displayName: url.lastPathComponent,
                                       modified: values.contentModificationDate,
                                       lastOpened: values.contentAccessDate, useCount: 0, whereFrom: nil)
-            Self.applyCheapFeatures(to: &candidate, words: words, kinds: parse.extensions)
+            Self.applyCheapFeatures(to: &candidate, words: words, kinds: parse.typeHints)
             candidate.features.retrievalRank = 0.5
             candidates.append(candidate)
         }
@@ -340,6 +340,12 @@ final class SearchController: ObservableObject {
         lastRanked = []
         pool = []
         shown = []
+        kinds = [:]
+        aboutWords = [:]
+        captionWords = [:]
+        // From the words as said (Pip's finder strips "in": "papers data f"
+        // read as data). A format ("pdf about …") is a filter, not a kind.
+        askedKind = Kinds.asked(in: timeHint ?? text)
         retrieved = false
         // What the name lane already showed for this text stays in the pool
         // and on screen until Spotlight's answer joins it.
@@ -365,7 +371,7 @@ final class SearchController: ObservableObject {
             // that feels like it's thinking.
             var scored = candidates
             for index in scored.indices {
-                Self.applyCheapFeatures(to: &scored[index], words: words, kinds: parsed.extensions)
+                Self.applyCheapFeatures(to: &scored[index], words: words, kinds: parsed.typeHints)
             }
             // Spotlight's own copy wins (it carries more), but what the name
             // lane found and it didn't stays.
@@ -398,6 +404,23 @@ final class SearchController: ObservableObject {
                 await self.addSemanticMatches(query: text)
                 guard !Task.isCancelled, self.query == text else { return }
                 mark("meaning")
+
+                // Typos in words no file holds: the index's own closest word.
+                if let fixed = await self.corrected(words) {
+                    ActivityLog.write(.search, "corrected \"\(words.joined(separator: " "))\" → \"\(fixed.joined(separator: " "))\"")
+                    await self.addStoreMatches(words: fixed, query: text)
+                    guard !Task.isCancelled, self.query == text else { return }
+                    await self.addSemanticMatches(query: fixed.joined(separator: " "), as: text)
+                    guard !Task.isCancelled, self.query == text else { return }
+                }
+
+                // What Pip says each file is, so "papers" finds all his papers.
+                await self.addKindGroup(query: text)
+                guard !Task.isCancelled, self.query == text else { return }
+                await self.loadKinds()
+                guard !Task.isCancelled, self.query == text else { return }
+                self.publish()
+                mark("kinds")
 
                 await self.addPhotoMatches(query: text)
                 guard !Task.isCancelled, self.query == text else { return }
@@ -457,8 +480,15 @@ final class SearchController: ObservableObject {
     private func addStoreMatches(words: [String], query text: String) async {
         // `words` hold no kind or time words (`QueryParse`). Ask for more hits
         // when a time or "pictures" filter will discard most of them.
-        let hits = await ContentStore.shared.search(words: words,
+        var hits = await ContentStore.shared.search(words: words,
                                                     limit: timeWindow == nil && !wantsPictures ? 60 : 500)
+        // A format was asked for ("pdf about transformers"): the best of that
+        // format too, or other formats fill the limit first.
+        if !parsed.extensions.isEmpty, !wantsPictures {
+            let seen = Set(hits.map(\.url))
+            hits += await ContentStore.shared.search(words: words, limit: 60, extensions: parsed.extensions)
+                .filter { !seen.contains($0.url) }
+        }
         guard !Task.isCancelled, query == text else { return }
         // Indexed files the search didn't return don't contain the words: a
         // measured zero, not unread.
@@ -487,6 +517,7 @@ final class SearchController: ObservableObject {
             pool[index].features.textMatch = max(pool[index].features.textMatch, evidence)
             pool[index].features.textWasMeasured = true
             if hit.allWords { pool[index].matchesAll = true }
+            if hit.near { pool[index].wordsNear = true }
             if pool[index].pdfTitle == nil, let title = hit.title { pool[index].pdfTitle = title }
         }
 
@@ -497,6 +528,7 @@ final class SearchController: ObservableObject {
             candidate.features.textMatch = evidence
             candidate.indexedTextMatch = evidence
             candidate.matchesAll = hit.allWords
+            candidate.wordsNear = hit.near
             // FTS5 scored this against text we hold, so the number means
             // something — unlike a zero on a file nobody opened.
             candidate.features.textWasMeasured = true
@@ -528,7 +560,7 @@ final class SearchController: ObservableObject {
             lastOpened: values.contentAccessDate,
             useCount: 0,
             whereFrom: nil)
-        Self.applyCheapFeatures(to: &candidate, words: words, kinds: parsed.extensions)
+        Self.applyCheapFeatures(to: &candidate, words: words, kinds: parsed.typeHints)
         return candidate
     }
 
@@ -682,12 +714,23 @@ final class SearchController: ObservableObject {
             // Within the strict set: a file whose *name or title* holds every
             // word is what the query names ("Attention Is All You Need") —
             // above one that merely mentions the words in its text.
-            let label = Set(Tokens.of(pool[index].displayName + " " + (pool[index].pdfTitle ?? "")))
+            // Pip's kind counts as a name: "Pay Date 2025-03-31.pdf" is a "pay statement".
+            let label = Set(Tokens.of(pool[index].displayName + " " + (pool[index].pdfTitle ?? "") + " "
+                                      + (kinds[pool[index].url.path] ?? "")))
             if strictWords.allSatisfy({ word in label.contains { $0 == word || $0.hasPrefix(word) } }) {
                 lift += 20
             }
-            // A screenshot showing the words goes below documents, unless images were asked for.
-            if pool[index].isImage, !wantsImages { lift -= 10 }
+            // Every word close together — a caption or a sentence about them —
+            // over a big file where each turns up somewhere.
+            // Not when pictures were asked for: then how a photo looks
+            // decides between ones whose captions all say the words (the
+            // best photo of a black suit isn't the one whose caption lists
+            // "black, suit" side by side).
+            if pool[index].wordsNear, !wantsPictures { lift += 10 }
+            if wantsPictures, pool[index].isImage { lift += 10 * pool[index].looks }
+            // A screenshot showing the words goes below documents, unless
+            // images were asked for — not a photo whose caption says them.
+            if pool[index].isImage, !wantsImages, !pool[index].wordsNear { lift -= 10 }
             pool[index].score += lift
         }
         pool.sort { $0.score > $1.score }
@@ -717,6 +760,7 @@ final class SearchController: ObservableObject {
                                      + (candidate.text ?? "")))
         let all = strictWords.allSatisfy { word in
             haystack.contains(word) || haystack.contains { $0.hasPrefix(word) }
+                || Tokens.plainForm(word).map(haystack.contains) == true
         }
         coverage[key] = all
         return all
@@ -728,6 +772,7 @@ final class SearchController: ObservableObject {
         let haystack = Set(Tokens.of(candidate.displayName + " " + (candidate.pdfTitle ?? "") + " " + fullText))
         candidate.matchesAll = strictWords.allSatisfy { word in
             haystack.contains(word) || haystack.contains { $0.hasPrefix(word) }
+                || Tokens.plainForm(word).map(haystack.contains) == true
         }
     }
 
@@ -751,10 +796,11 @@ final class SearchController: ObservableObject {
     }
 
     /// Adds documents about the query, whatever their words. Additive only.
-    private func addSemanticMatches(query text: String) async {
+    /// `as`: the search on screen, when `text` is a corrected form of it.
+    private func addSemanticMatches(query text: String, as shown: String? = nil) async {
         guard Self.wantsMeaning(text) else { return }
         let matches = await SemanticIndex.shared.search(Tokens.expandText(text), limit: 30)
-        guard !Task.isCancelled, query == text, let best = matches.first else { return }
+        guard !Task.isCancelled, query == (shown ?? text), let best = matches.first else { return }
 
         semanticTop = matches.prefix(3).map {
             "\($0.url.lastPathComponent) \(String(format: "%.2f", $0.similarity))"
@@ -774,7 +820,7 @@ final class SearchController: ObservableObject {
                 continue
             }
 
-            guard var candidate = await storedCandidate(for: match.url, words: words, query: text)
+            guard var candidate = await storedCandidate(for: match.url, words: words, query: shown ?? text)
             else { continue }
             candidate.features.semanticMatch = score
             candidate.features.textWasMeasured = true
@@ -808,18 +854,22 @@ final class SearchController: ObservableObject {
         guard !parsed.phrase.isEmpty, wantsPictures || !wantsCode,
               wantedKinds.isSubset(of: imageKinds),
               text.range(of: #"\.[A-Za-z0-9]{2,4}\b"#, options: .regularExpression) == nil else { return }
-        let matches = await PhotoVectors.shared.search(parsed.phrase, limit: wantsPictures ? 60 : 12)
+        // Captions already matched pictures: how each one looks orders them
+        // (forty photos captioned "yellow kurta" tie on words).
+        let captioned = pool.contains { $0.isImage && $0.matchesAll }
+        let matches = await PhotoVectors.shared.search(parsed.phrase, limit: wantsPictures || captioned ? 60 : 12)
         guard !Task.isCancelled, query == text, let best = matches.first else { return }
         let floor = max(Self.looksFloor, best.similarity - Self.looksSpread)
         let words = parsed.words
         var contributed = 0
         for match in matches {
             let clear = match.similarity >= floor
-            guard clear || wantsPictures else { break }
             // 0.25 → 0.4, 0.32 and up → 0.8: the same footing, and the same
             // cap, as meaning (`meaningScore`).
             let score = Double(min(max((match.similarity - 0.18) / 0.14, 0), 1)) * 0.8
             var index = pool.firstIndex { $0.url == match.url }
+            // Not clear and not asked for pictures: only to order the ones already found.
+            guard clear || wantsPictures || index != nil else { continue }
             if index == nil, let candidate = await storedCandidate(for: match.url, words: words, query: text) {
                 pool.append(candidate)
                 index = pool.count - 1
@@ -847,7 +897,7 @@ final class SearchController: ObservableObject {
         let known = Set(pool.map(\.url))
 
         for var candidate in scanned where !known.contains(candidate.url) {
-            Self.applyCheapFeatures(to: &candidate, words: words, kinds: parsed.extensions)
+            Self.applyCheapFeatures(to: &candidate, words: words, kinds: parsed.typeHints)
             // Spotlight didn't return it, so it has no retrieval rank of its
             // own. Middling rather than zero: being absent from the index says
             // nothing about whether it's the right file.
@@ -974,9 +1024,16 @@ final class SearchController: ObservableObject {
             if pool.contains(where: { $0.url.path.hasPrefix(root) }) { pool.removeAll { !$0.url.path.hasPrefix(root) } }
         }
         applyTimeWindow()
+        // A format typed outright ("pdf about transformers"): only that
+        // format, when any file of it matched.
+        if !parsed.extensions.isEmpty, !wantsPictures,
+           pool.contains(where: { parsed.extensions.contains($0.url.pathExtension.lowercased()) }) {
+            pool.removeAll { !parsed.extensions.contains($0.url.pathExtension.lowercased()) }
+        }
         ranker.score(&pool)
         // Incumbency before the strict lift, or it outweighs every feature.
         applyIncumbency(&pool)
+        applyDescribedKind()
         applyStrictness()
         applyKindPreference()
         applyLatest()
@@ -1101,6 +1158,140 @@ final class SearchController: ObservableObject {
 
     /// What's currently on screen, for incumbency.
     private var shown: Set<URL> = []
+
+    /// The kind each file is filed under in the store ("research paper",
+    /// `Kinds`); "" when it isn't filed yet. Looked up once per file.
+    private var kinds: [String: String] = [:]
+    /// The words of Pip's description, for what a file is about.
+    private var aboutWords: [String: Set<String>] = [:]
+    /// The words of a picture's caption — what it shows, not text in it.
+    private var captionWords: [String: Set<String>] = [:]
+    /// The kind the query asks for ("can you list all research papers" →
+    /// "research paper"); nil when it names none.
+    private var askedKind: String?
+
+    /// The group asked for, straight from the store: every file filed under
+    /// that kind or another kind of the same thing ("exam paper" for
+    /// "research papers"), whatever their names and however often their
+    /// text says the words.
+    private func addKindGroup(query text: String) async {
+        guard let wanted = askedKind else { return }
+        let group = await ContentStore.shared.documents(ofKind: Kinds.head(wanted))
+        guard !Task.isCancelled, query == text, !group.isEmpty else { return }
+        let known = Set(pool.map(\.url.path))
+        for (path, kind) in group {
+            kinds[path] = kind
+            guard !known.contains(path) else { continue }
+            let url = URL(fileURLWithPath: path)
+            if !parsed.extensions.isEmpty, !parsed.extensions.contains(url.pathExtension.lowercased()) { continue }
+            guard var candidate = await storedCandidate(for: url, words: parsed.words, query: text) else { continue }
+            guard !Task.isCancelled, query == text else { return }
+            candidate.features.retrievalRank = 0.65
+            pool.append(candidate)
+        }
+    }
+
+    /// Words no file holds, replaced by the closest word the index does
+    /// ("retentve netwrk" → "retentive network"); nil when nothing changed.
+    private func corrected(_ words: [String]) async -> [String]? {
+        var changed = false
+        var out: [String] = []
+        for word in words {
+            if let fix = await ContentStore.shared.correction(for: word) {
+                out.append(Tokens.stem(fix)); changed = true
+            } else {
+                out.append(word)
+            }
+        }
+        return changed ? out : nil
+    }
+
+    /// Kinds, descriptions and captions for the best of the pool.
+    private func loadKinds() async {
+        let paths = pool.prefix(150).map(\.url.path).filter { aboutWords[$0] == nil && captionWords[$0] == nil }
+        guard !paths.isEmpty else { return }
+        let notes = await ContentStore.shared.notes(for: paths)
+        for path in paths {
+            let note = notes[path]
+            if kinds[path] == nil { kinds[path] = note?.kind ?? "" }
+            aboutWords[path] = note?.about.map { Set(Tokens.of($0)) } ?? []
+            if let caption = note?.caption { captionWords[path] = Set(Tokens.of(caption)) }
+        }
+    }
+
+    /// How a file's kind answers the search (`Kinds.match`): 2, 1, 0 or nil.
+    private func kindMatch(_ url: URL) -> Int? {
+        guard let wanted = askedKind else { return nil }
+        return Kinds.match(kinds[url.path], asked: wanted)
+    }
+
+    /// Could be the kind asked for: filed under it, or a picture whose
+    /// caption says it (a photographed receipt) — not a screenshot that
+    /// merely shows the words "research paper", nor code. True when no kind
+    /// was asked, or for a document not filed yet.
+    func fitsAskedKind(_ url: URL) -> Bool {
+        guard let wanted = askedKind else { return true }
+        if let match = kindMatch(url) { return match > 0 }
+        if DirectScan.codeKinds.contains(url.pathExtension.lowercased()) { return wantsCode }
+        guard Candidate.imageKinds.contains(url.pathExtension.lowercased()) else { return true }
+        let head = Kinds.head(wanted)
+        return captionWords[url.path]?.contains { Tokens.stem($0) == head || $0.hasPrefix(head) } ?? false
+    }
+
+    /// Filed under the kind the last search asked for (or the same thing).
+    func isAskedKind(_ url: URL) -> Bool { (kindMatch(url) ?? 0) > 0 }
+
+    /// The group first: a file filed under the kind asked for goes up (the
+    /// same kind most, "research paper"; then the same thing, "exam
+    /// paper"); one filed under another kind, or a screenshot or script
+    /// that only holds the words, goes down. And a file whose description
+    /// holds the query's other words is about them.
+    private func applyDescribedKind() {
+        var changed = false
+        if askedKind != nil {
+            // The group asked for is a tier of its own, above everything that
+            // only holds the words: the same kind ("research paper"), or any
+            // kind of the thing when only the thing was asked ("papers").
+            // Another kind of the same thing ("exam paper" for "research
+            // papers") comes after it.
+            let bare = !(askedKind ?? "").contains(" ")
+            var inGroup = 0
+            for index in pool.indices {
+                switch kindMatch(pool[index].url) {
+                case 2?: pool[index].score += 200; inGroup += 1
+                case 1? where bare: pool[index].score += 200; inGroup += 1
+                case 1?: pool[index].score += 1.0; inGroup += 1
+                default: break
+                }
+            }
+            // The group is there: what isn't in it goes down. Documents not
+            // filed yet keep their place.
+            if inGroup >= 2 {
+                for index in pool.indices where !fitsAskedKind(pool[index].url) {
+                    pool[index].score -= 0.8
+                }
+            }
+            changed = inGroup > 0
+        }
+        // What it's about: the query's other words in Pip's line about the
+        // file ("pdf about transformers" → "Attention paper on transformer
+        // architecture"; a resume that mentions transformers isn't about them).
+        let kindWords = Set(askedKind?.split(separator: " ").map(String.init) ?? [])
+        let topic = parsed.words.filter { !kindWords.contains(Tokens.stem($0)) && $0.count >= 3 }
+        if !topic.isEmpty {
+            for index in pool.indices {
+                guard let about = aboutWords[pool[index].url.path], !about.isEmpty else { continue }
+                let held = topic.filter { word in
+                    about.contains(word) || about.contains { $0.hasPrefix(word) }
+                        || Tokens.plainForm(word).map(about.contains) == true
+                }.count
+                guard held > 0 else { continue }
+                pool[index].score += 0.6 * Double(held) / Double(topic.count)
+                changed = true
+            }
+        }
+        if changed { pool.sort { $0.score > $1.score } }
+    }
 
     /// 8% bonus for already being visible, so near-ties don't reshuffle.
     private func applyIncumbency(_ candidates: inout [Candidate]) {
@@ -1261,7 +1452,7 @@ final class SearchController: ObservableObject {
                 candidate.pdfTitle = body.title
                 markCoverage(&candidate, fullText: body.text)
 
-                Self.applyCheapFeatures(to: &candidate, words: words, kinds: parsed.extensions)
+                Self.applyCheapFeatures(to: &candidate, words: words, kinds: parsed.typeHints)
                 if let title = body.title {
                     candidate.features.nameMatch = max(candidate.features.nameMatch,
                                                        Fuzzy.score(words: words, against: title))
@@ -1437,7 +1628,9 @@ final class SearchController: ObservableObject {
             run(text)
         }
         let best = ranked.first?.score ?? 0
-        return best > 0 ? ranked.filter { $0.score >= best * 0.33 } : ranked
+        // A third of the best — but a file filed under the kind asked for
+        // stays ("papers": the one named "…-Paper.pdf" isn't more of a paper).
+        return best > 0 ? ranked.filter { $0.score >= best * 0.33 || isAskedKind($0.url) } : ranked
     }
 
     /// Hands the waiting caller what's ranked now. Called when a run ends,
