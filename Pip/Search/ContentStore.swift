@@ -217,7 +217,33 @@ actor ContentStore {
                                   + distinct.sorted().prefix(6).joined(separator: ", "))
                 return true
             },
+            // "In Desktop or Downloads" by folder, not by matching path text.
+            SQLite.Migration(version: 10, name: "files_folder index") { [unowned self] db in
+                guard v2Ready else { return false }
+                return SQLite.exec(db, "CREATE INDEX IF NOT EXISTS files_folder ON files(folder)")
+            },
         ]
+    }
+
+    /// `column` (a folder path) is one of these home folders or inside it,
+    /// as a range the files_folder index can use (a folder inside Desktop is
+    /// "~/Desktop/…": from "~/Desktop/" up to "~/Desktop0").
+    private static func inHome(_ column: String, _ folders: [String]) -> String {
+        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
+        return "(" + folders.map { name in
+            let root = "\(home)/\(name)"
+            return "\(column) = '\(root)' OR (\(column) >= '\(root)/' AND \(column) < '\(root)0')"
+        }.joined(separator: " OR ") + ")"
+    }
+
+    /// A `documents.path` in these home folders or below: by the files
+    /// table's folder — or, for the few documents the folder scan never
+    /// recorded (a GIF in a project folder), by the path as before.
+    private static func pathIn(_ folders: [String]) -> String {
+        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
+        let byPath = folders.map { "path LIKE '\(home)/\($0)/%'" }.joined(separator: " OR ")
+        return "(path IN (SELECT path FROM files WHERE \(inHome("folder", folders))) "
+            + "OR (path NOT IN (SELECT path FROM files) AND (\(byPath))))"
     }
 
     /// search_fts's columns as an index only: rows are `search_rows` ids.
@@ -983,11 +1009,9 @@ actor ContentStore {
     /// Photos read but not captioned: Desktop and Downloads first, newest
     /// first, screenshots last.
     private var uncaptionedSQL: String {
-        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
-        let folders = ["Desktop", "Documents", "Downloads", "Pictures"]
-            .map { "path LIKE '\(home)/\($0)/%'" }.joined(separator: " OR ")
-        return "FROM documents WHERE caption IS NULL AND mtime <> -1 AND \(Self.imageSQL) "
-            + "AND (\(folders)) AND path NOT LIKE '%.photoslibrary/%'"
+        "FROM documents WHERE caption IS NULL AND mtime <> -1 AND \(Self.imageSQL) "
+            + "AND \(Self.pathIn(["Desktop", "Documents", "Downloads", "Pictures"])) "
+            + "AND path NOT LIKE '%.photoslibrary/%'"
     }
 
     func uncaptionedPhotos(limit: Int) -> [(path: String, modified: Date)] {
@@ -997,9 +1021,8 @@ actor ContentStore {
         defer { sqlite3_finalize(statement) }
         let screenshot = "(lower(path) LIKE '%/screenshot%' OR lower(path) LIKE '%/screen shot%' "
             + "OR lower(path) LIKE '%/cleanshot%')"
-        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
-        let folder = "(CASE WHEN path LIKE '\(home)/Desktop/%' OR path LIKE '\(home)/Downloads/%' THEN 0 "
-            + "WHEN path LIKE '\(home)/Documents/%' THEN 1 ELSE 2 END)"
+        let folder = "(CASE WHEN \(Self.pathIn(["Desktop", "Downloads"])) THEN 0 "
+            + "WHEN \(Self.pathIn(["Documents"])) THEN 1 ELSE 2 END)"
         let sql = "SELECT path, mtime \(uncaptionedSQL) ORDER BY \(folder), \(screenshot), mtime DESC LIMIT \(limit)"
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
         var out: [(path: String, modified: Date)] = []
@@ -1059,14 +1082,12 @@ actor ContentStore {
     func pictureFiles() -> [(path: String, modified: Double)] {
         open()
         guard ready, v2Ready, let database else { return [] }
-        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
         let sql = """
             SELECT path, mtime FROM files
              WHERE kind IN ('png','jpg','jpeg','heic','webp') AND path NOT LIKE '%.photoslibrary/%'
-               AND (path LIKE '\(home)/Desktop/%' OR path LIKE '\(home)/Downloads/%'
-                    OR path LIKE '\(home)/Documents/%' OR path LIKE '\(home)/Pictures/%')
-             ORDER BY CASE WHEN path LIKE '\(home)/Desktop/%' OR path LIKE '\(home)/Downloads/%' THEN 0
-                           WHEN path LIKE '\(home)/Documents/%' THEN 1 ELSE 2 END, mtime DESC
+               AND \(Self.inHome("folder", ["Desktop", "Downloads", "Documents", "Pictures"]))
+             ORDER BY CASE WHEN \(Self.inHome("folder", ["Desktop", "Downloads"])) THEN 0
+                           WHEN \(Self.inHome("folder", ["Documents"])) THEN 1 ELSE 2 END, mtime DESC
             """
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
