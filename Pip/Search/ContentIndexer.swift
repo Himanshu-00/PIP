@@ -127,7 +127,8 @@ final class ContentIndexer {
         let kinds = DirectScan.readableKinds.union(DirectScan.codeKinds)
         let onBattery = PowerMonitor.isOnBattery
         var entries: [(path: String, modified: Date?, size: Int?)] = []
-        var toRead: [Candidate] = []
+        var candidates: [Candidate] = []
+        var gone: [String] = []
         var batteryImages = 0
         for path in paths {
             let url = URL(fileURLWithPath: path)
@@ -135,7 +136,7 @@ final class ContentIndexer {
             guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey,
                                                                  .contentAccessDateKey, .isRegularFileKey]),
                   values.isRegularFile == true else {
-                await ContentStore.shared.forget(path: path)       // gone (or moved — the next pass carries it over)
+                gone.append(path)       // deleted — or renamed: decided after the new paths are recorded
                 continue
             }
             let size = values.fileSize ?? 0
@@ -149,11 +150,18 @@ final class ContentIndexer {
                 guard batteryImages < 5 else { continue }
                 batteryImages += 1
             }
-            if !(await ContentStore.shared.isCurrent(path: path, modified: candidate.modified)) {
-                toRead.append(candidate)
-            }
+            candidates.append(candidate)
         }
-        await ContentStore.shared.recordFiles(entries)
+        // New paths first: a renamed file is matched to its old row (same
+        // inode) and keeps its text and vectors — so it's current, not read
+        // again, and its old path isn't forgotten.
+        let renamed = await ContentStore.shared.recordFiles(entries)
+        for path in gone where !renamed.contains(path) { await ContentStore.shared.forget(path: path) }
+        var toRead: [Candidate] = []
+        for candidate in candidates where !(await ContentStore.shared.isCurrent(path: candidate.url.path,
+                                                                                  modified: candidate.modified)) {
+            toRead.append(candidate)
+        }
         guard !toRead.isEmpty else { return }
         running = true
         defer { running = false }

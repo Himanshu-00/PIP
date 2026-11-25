@@ -174,6 +174,19 @@ actor PhotoVectors {
         loaded = false
     }
 
+    /// A renamed or moved photo keeps its vector (same picture, new path).
+    func rename(from old: String, to new: String) {
+        guard open() else { return }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "UPDATE OR REPLACE photos SET path = ? WHERE path = ?", -1, &statement, nil) == SQLITE_OK
+        else { return }
+        SQLite.bind(statement, 1, new)
+        SQLite.bind(statement, 2, old)
+        sqlite3_step(statement)
+        loaded = false      // read again with the new path on the next search
+    }
+
     // MARK: - Backlog
 
     /// Photos without a current vector, in the order to embed them.

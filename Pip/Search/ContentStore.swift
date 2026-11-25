@@ -502,9 +502,12 @@ actor ContentStore {
 
     /// Records files in the usual folders, read or not, so names are searchable.
     /// A renamed or moved file (same inode) keeps its text and vectors.
-    func recordFiles(_ entries: [(path: String, modified: Date?, size: Int?)]) {
+    /// Returns the old paths carried over to new ones.
+    @discardableResult
+    func recordFiles(_ entries: [(path: String, modified: Date?, size: Int?)]) -> Set<String> {
         open()
-        guard v2Ready, let database, !entries.isEmpty else { return }
+        var renamed = Set<String>()
+        guard v2Ready, let database, !entries.isEmpty else { return renamed }
         SQLite.exec(database, "BEGIN")
         // One prepared lookup reused for every file: most are unchanged, and
         // for those this is the only work done.
@@ -521,11 +524,18 @@ actor ContentStore {
             // New or changed: only now ask the disk for its identity.
             let inode = (try? FileManager.default.attributesOfItem(atPath: entry.path))
                 .flatMap { ($0[.systemFileNumber] as? NSNumber)?.uint64Value }
-            // Same inode, old path gone, same date: the same file renamed.
+            // Same inode, old path gone, same date and size: the same file
+            // renamed. Another date or size is a new file that was given the
+            // old one's inode — read as new.
             if known == nil, let inode, let old = pathWithInode(inode, other: entry.path),
-               !FileManager.default.fileExists(atPath: old.path),
-               abs(old.mtime - stamp) < 1 {
-                rename(from: old.path, to: entry.path)
+               !FileManager.default.fileExists(atPath: old.path) {
+                if abs(old.mtime - stamp) < 1, entry.size == nil || old.size == Int64(entry.size ?? 0) {
+                    rename(from: old.path, to: entry.path)
+                    renamed.insert(old.path)
+                } else {
+                    ActivityLog.write(.search, "inode reused: \((entry.path as NSString).lastPathComponent) is a new file, "
+                                      + "not \((old.path as NSString).lastPathComponent) renamed")
+                }
             }
 
             var upsert: OpaquePointer?
@@ -561,27 +571,29 @@ actor ContentStore {
             }
         }
         SQLite.exec(database, "COMMIT")
+        return renamed
     }
 
-    private func pathWithInode(_ inode: UInt64, other path: String) -> (path: String, mtime: Double)? {
+    private func pathWithInode(_ inode: UInt64, other path: String) -> (path: String, mtime: Double, size: Int64)? {
         guard let database else { return nil }
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(database, "SELECT path, mtime FROM files WHERE inode = ? AND path != ? LIMIT 1",
+        guard sqlite3_prepare_v2(database, "SELECT path, mtime, size FROM files WHERE inode = ? AND path != ? LIMIT 1",
                                  -1, &statement, nil) == SQLITE_OK else { return nil }
         sqlite3_bind_int64(statement, 1, Int64(bitPattern: inode))
         SQLite.bind(statement, 2, path)
         guard sqlite3_step(statement) == SQLITE_ROW, let found = SQLite.string(statement, 0) else { return nil }
-        return (found, sqlite3_column_double(statement, 1))
+        return (found, sqlite3_column_double(statement, 1), sqlite3_column_int64(statement, 2))
     }
 
     /// Moves everything known about `old` to `new`: the stored text, the
     /// index rows (re-made with the new name), and the meaning vectors.
     private func rename(from old: String, to new: String) {
         guard let database else { return }
-        for sql in ["UPDATE documents SET path = ? WHERE path = ?",
-                    "UPDATE unreadable SET path = ? WHERE path = ?",
-                    "UPDATE files SET path = ?, name = ? WHERE path = ?"] {
+        // OR REPLACE: a row the indexer already made for the new path gives way.
+        for sql in ["UPDATE OR REPLACE documents SET path = ? WHERE path = ?",
+                    "UPDATE OR REPLACE unreadable SET path = ? WHERE path = ?",
+                    "UPDATE OR REPLACE files SET path = ?, name = ? WHERE path = ?"] {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { continue }
@@ -600,8 +612,7 @@ actor ContentStore {
         ActivityLog.write(.search, "renamed in the index: \((old as NSString).lastPathComponent) → \((new as NSString).lastPathComponent)")
         Task {
             await SemanticIndex.shared.rename(from: old, to: new)
-            // A photo's vector is quick to make again under its new name.
-            await PhotoVectors.shared.forget(path: old)
+            await PhotoVectors.shared.rename(from: old, to: new)
         }
     }
 
