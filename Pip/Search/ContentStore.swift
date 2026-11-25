@@ -165,6 +165,58 @@ actor ContentStore {
                 if ok { setMeta("vacuum_pending", "1") }
                 return ok
             },
+            // Kinds in one spelling: accents folded, "cv" → "resume" (`Kinds.normalise`).
+            SQLite.Migration(version: 8, name: "kinds in one spelling") { [unowned self] _ in
+                var changes: [(from: String, to: String)] = []
+                for (kind, _) in kindCounts() {
+                    if let tidy = Kinds.normalise(kind), tidy != kind { changes.append((kind, tidy)) }
+                }
+                for change in changes {
+                    var statement: OpaquePointer?
+                    defer { sqlite3_finalize(statement) }
+                    guard sqlite3_prepare_v2(database, "UPDATE documents SET kind = ? WHERE kind = ?", -1, &statement, nil) == SQLITE_OK
+                    else { return false }
+                    SQLite.bind(statement, 1, change.to)
+                    SQLite.bind(statement, 2, change.from)
+                    guard sqlite3_step(statement) == SQLITE_DONE else { return false }
+                }
+                ActivityLog.write(.search, "kinds: \(changes.count) respelled"
+                                  + changes.prefix(5).map { " (\($0.from) → \($0.to))" }.joined())
+                return true
+            },
+            // Words the old stemming cut ("sett", "train", "mapp") made whole
+            // from each document's own description.
+            SQLite.Migration(version: 9, name: "kinds with whole words") { [unowned self] _ in
+                var rows: [(path: String, kind: String, about: String)] = []
+                var read: OpaquePointer?
+                guard sqlite3_prepare_v2(database, "SELECT path, kind, about FROM documents WHERE kind != '' AND about != ''",
+                                         -1, &read, nil) == SQLITE_OK else { return false }
+                while sqlite3_step(read) == SQLITE_ROW {
+                    if let path = SQLite.string(read, 0), let kind = SQLite.string(read, 1), let about = SQLite.string(read, 2) {
+                        rows.append((path, kind, about))
+                    }
+                }
+                sqlite3_finalize(read)
+                var fixed: [(path: String, from: String, to: String)] = []
+                for row in rows {
+                    let whole = Kinds.repaired(row.kind, from: row.about)
+                    if whole != row.kind { fixed.append((row.path, row.kind, whole)) }
+                }
+                var write: OpaquePointer?
+                defer { sqlite3_finalize(write) }
+                guard sqlite3_prepare_v2(database, "UPDATE documents SET kind = ? WHERE path = ?", -1, &write, nil) == SQLITE_OK
+                else { return false }
+                for fix in fixed {
+                    sqlite3_reset(write)
+                    SQLite.bind(write, 1, fix.to)
+                    SQLite.bind(write, 2, fix.path)
+                    guard sqlite3_step(write) == SQLITE_DONE else { return false }
+                }
+                let distinct = Set(fixed.map { "\($0.from) → \($0.to)" })
+                ActivityLog.write(.search, "kinds: \(fixed.count) made whole (\(distinct.count) kinds), e.g. "
+                                  + distinct.sorted().prefix(6).joined(separator: ", "))
+                return true
+            },
         ]
     }
 
@@ -1116,6 +1168,21 @@ actor ContentStore {
         var out: [(String, String)] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             if let path = SQLite.string(statement, 0), let kind = SQLite.string(statement, 1) { out.append((path, kind)) }
+        }
+        return out
+    }
+
+    /// Every kind in use and how many documents are filed under it, most first.
+    func kindCounts() -> [(kind: String, count: Int)] {
+        open()
+        guard ready, let database else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "SELECT kind, count(*) c FROM documents WHERE kind IS NOT NULL AND kind != '' "
+                                 + "GROUP BY kind ORDER BY c DESC", -1, &statement, nil) == SQLITE_OK else { return [] }
+        var out: [(String, Int)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let kind = SQLite.string(statement, 0) { out.append((kind, Int(sqlite3_column_int(statement, 1)))) }
         }
         return out
     }

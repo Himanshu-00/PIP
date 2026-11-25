@@ -7,15 +7,51 @@ import Foundation
 /// query the same way.
 enum Kinds {
 
-    /// One spelling for a kind: lowercase words, each stemmed, at most three
-    /// ("Research papers" → "research paper").
+    /// One spelling for a kind: lowercase words without accents, each
+    /// stemmed, at most three ("Research papers" → "research paper"), and a
+    /// second spelling merged ("CV" → "resume").
     static func normalise(_ phrase: String) -> String? {
-        let words = Tokens.of(phrase)
+        // "Résumé" and "resume" are one kind.
+        let folded = phrase.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+        let words = Tokens.of(folded)
             .filter { $0.count >= 2 && !$0.contains(where: \.isNumber) }
             .suffix(3)
-            .map(Tokens.stem)
-        return words.isEmpty ? nil : words.joined(separator: " ")
+            .map(singular)
+        guard !words.isEmpty else { return nil }
+        let kind = words.joined(separator: " ")
+        return variants[kind] ?? kind
     }
+
+    /// "papers" → "paper", and nothing else: a stem would cut "setting" to
+    /// "sett" (and again each time it ran), so kinds are only made singular.
+    static func singular(_ word: String) -> String {
+        guard word.count >= 5, word.hasSuffix("s"), !word.hasSuffix("ss"), !word.hasSuffix("us"),
+              !word.hasSuffix("is") else { return word }
+        return String(word.dropLast())
+    }
+
+    /// A kind whose words were cut by the old stemming ("configuration
+    /// sett", "train data"), made whole again from the description's own
+    /// words ("Configuration settings for…" → "configuration setting").
+    static func repaired(_ kind: String, from about: String) -> String {
+        let said = Tokens.of(about.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil))
+        return kind.split(separator: " ").map { part -> String in
+            let word = String(part)
+            // Said as it is: that was the word ("Build script for building…").
+            guard !said.contains(word), !said.contains(word + "s") else { return word }
+            let whole = said.filter { $0.count > word.count && $0.hasPrefix(word) }
+                .filter { ["ing", "ings", "ed"].contains(String($0.dropFirst(word.count)))
+                          || ["ing", "ings", "ed"].contains(String($0.dropFirst(word.count + 1))) && $0.dropFirst(word.count).first == word.last }
+                .min { $0.count < $1.count }
+            return whole.map(singular) ?? word
+        }.joined(separator: " ")
+    }
+
+    /// Other spellings of the same kind — not a list of kinds: Pip names
+    /// those; this only merges what he spells two ways.
+    private static let variants: [String: String] = [
+        "cv": "resume", "curriculum vita": "resume", "curriculum vitae": "resume",
+    ]
 
     /// The last word of a kind: what kind of thing it is ("paper").
     static func head(_ kind: String) -> String {

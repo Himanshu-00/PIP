@@ -205,6 +205,13 @@ final class DocumentNotes {
     /// the line itself, so searches can use them at once; Pip's brain looks
     /// again while the Mac is idle (`run`).
     static func fileOldDescriptions() async {
+        // The kinds in use, so the list can be looked over: the most common,
+        // and how many are used only once (spelt oddly, or truly rare).
+        let counts = await ContentStore.shared.kindCounts()
+        let once = counts.filter { $0.count == 1 }
+        ActivityLog.write(.search, "kinds: \(counts.count) in use; most: "
+                          + counts.prefix(8).map { "\($0.kind) \($0.count)" }.joined(separator: ", ")
+                          + "; \(once.count) used once (e.g. " + once.prefix(5).map(\.kind).joined(separator: ", ") + ")")
         let old = await ContentStore.shared.describedWithoutKind()
         guard !old.isEmpty else { return }
         let kinds = await Task.detached(priority: .utility) {
