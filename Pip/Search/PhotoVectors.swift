@@ -132,6 +132,21 @@ actor PhotoVectors {
         SQLite.exec(database, "PRAGMA journal_mode = WAL")
         // An empty vector means "read, can't be embedded" (unreadable image).
         SQLite.exec(database, "CREATE TABLE IF NOT EXISTS photos (path TEXT PRIMARY KEY, mtime REAL NOT NULL, vec BLOB)")
+        SQLite.migrate(database, "photo.db", [
+            // Which MobileCLIP made the vectors. Ones from before this was
+            // kept were made by the only revision there has been.
+            SQLite.Migration(version: 1, name: "meta with the model revision") {
+                SQLite.exec($0, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+                    && (SQLite.meta($0, "model_revision") != nil || SQLite.setMeta($0, "model_revision", Self.modelRevision))
+            },
+        ])
+        // Another model's vectors can't be compared with this one's: cleared,
+        // and made again in the background (`photoVectorBacklog`).
+        if let made = SQLite.meta(database, "model_revision"), made != Self.modelRevision {
+            SQLite.exec(database, "DELETE FROM photos")
+            SQLite.setMeta(database, "model_revision", Self.modelRevision)
+            ActivityLog.write(.search, "photo.db: vectors were made by MobileCLIP \(made.prefix(7)), cleared for \(Self.modelRevision.prefix(7))")
+        }
         SQLite.excludeFromBackup(location)
         return true
     }
@@ -157,6 +172,19 @@ actor PhotoVectors {
         SQLite.bind(statement, 1, path)
         sqlite3_step(statement)
         loaded = false
+    }
+
+    /// A renamed or moved photo keeps its vector (same picture, new path).
+    func rename(from old: String, to new: String) {
+        guard open() else { return }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "UPDATE OR REPLACE photos SET path = ? WHERE path = ?", -1, &statement, nil) == SQLITE_OK
+        else { return }
+        SQLite.bind(statement, 1, new)
+        SQLite.bind(statement, 2, old)
+        sqlite3_step(statement)
+        loaded = false      // read again with the new path on the next search
     }
 
     // MARK: - Backlog

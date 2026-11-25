@@ -188,9 +188,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 for document in picked {
                     let started = Date()
-                    guard let about = await DocumentNotes.describe(document) else { break }
+                    guard let described = await DocumentNotes.describe(document) else { break }
+                    let about = described.about + " [\(described.kind ?? "-")]"
                     if let saved = await ContentStore.shared.setAbout(path: document.path, modified: document.modified,
-                                                                      about: about), !about.isEmpty {
+                                                                      about: described.about, kind: described.kind),
+                       !described.about.isEmpty {
                         await SemanticIndex.shared.add(path: document.path, modified: document.modified,
                                                        title: saved.title, text: saved.text, replace: true)
                     }
@@ -241,6 +243,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         #endif
         // `--args -searchDebug "flight ticket latest"`: one query's top ten and why.
         if let query = UserDefaults.standard.string(forKey: "searchDebug") { Task { await SearchChecks.explain(query) } }
+        // `-searchChecks YES`: the hand set, after the indexes have opened.
+        // `-fileKinds paper`: Pip's brain files that group's documents again now.
+        if let head = UserDefaults.standard.string(forKey: "fileKinds") {
+            Task {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                // `-fileKinds all`: every kind still read from a line, in
+                // batches, each saved as it's done.
+                if head == "all" {
+                    var filed = 0
+                    while true {
+                        let batch = await ContentStore.shared.kindsToRecheck(first: [], limit: 24)
+                        guard !batch.isEmpty else { break }
+                        var kinds: [(path: String, kind: String)] = []
+                        for document in batch {
+                            // A failed answer is filed as read from the line, so it isn't asked forever.
+                            let kind = await DocumentNotes.kind(of: document) ?? Kinds.fromLine(document.about) ?? "document"
+                            kinds.append((document.path, kind))
+                        }
+                        await ContentStore.shared.setKinds(kinds, by: "pip")
+                        filed += kinds.count
+                        ActivityLog.write(.search, "kinds: filed \(filed) (\(await ContentStore.shared.kindsToRecheckCount()) left) — "
+                            + kinds.prefix(2).map { "\(($0.path as NSString).lastPathComponent): \($0.kind)" }.joined(separator: ", "))
+                    }
+                    ActivityLog.write(.search, "file kinds done: \(filed)")
+                    return
+                }
+                let group = await ContentStore.shared.documents(ofKind: head).map(\.path)
+                let batch = await ContentStore.shared.kindsToRecheck(first: group, limit: group.count)
+                    .filter { group.contains($0.path) }
+                var filed: [(path: String, kind: String)] = []
+                for document in batch {
+                    guard let kind = await DocumentNotes.kind(of: document) else { continue }
+                    filed.append((document.path, kind))
+                    ActivityLog.write(.search, "filed \((document.path as NSString).lastPathComponent): \(kind)  (was from line: \(document.about))")
+                }
+                await ContentStore.shared.setKinds(filed, by: "pip")
+                ActivityLog.write(.search, "file kinds done: \(filed.count)")
+            }
+        }
+        // `-searchChecks all`: the replay of past opens and the photo checks too.
+        if let checks = UserDefaults.standard.string(forKey: "searchChecks") {
+            Task {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if checks == "all" { await SearchChecks.run() } else { await SearchChecks.runHandSet() }
+                ActivityLog.write(.search, "search checks done")
+            }
+        }
         // `--args -summariseSession 2026-11-07`: that day's summary written now.
         if let day = UserDefaults.standard.string(forKey: "summariseSession") { agent.summariseLater(day: day, after: 1) }
         // `--args -showVocabulary YES`: the words speech recognition is told to expect.
@@ -1175,6 +1224,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return self.agent.isThinking || self.voice.isBusy || PipVoice.shared.isSpeaking
         }
         DocumentNotes.shared.pipInUse = indexer.captions.pipInUse
+        // Older descriptions get a kind at once, so searches can go to it.
+        Task.detached(priority: .utility) { await DocumentNotes.fileOldDescriptions() }
         // When Pip last stopped working: his window stays a while after.
         Publishers.CombineLatest(agent.$isThinking, PipVoice.shared.$isSpeaking)
             .receive(on: RunLoop.main)

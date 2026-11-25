@@ -30,6 +30,9 @@ actor ContentStore {
         var phrase = false
         /// Every query word appears somewhere in its title, headings or text.
         var allWords = false
+        /// …and close together (within a dozen words): a caption or sentence
+        /// about them, not a huge file where each turns up somewhere.
+        var near = false
     }
 
     private var database: OpaquePointer?
@@ -74,21 +77,227 @@ actor ContentStore {
             return
         }
         ready = true
-        // Fails harmlessly when the column is already there.
-        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN headings TEXT")
-        // A photo's one-line description from Pip's vision (`PhotoCaptions`).
-        // NULL = not captioned yet, '' = looked at, nothing to say (too small).
-        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN caption TEXT")
-        // A document's one-line description from Pip's brain (`DocumentNotes`):
-        // what kind of file it is and what it's about, in the model's own words.
-        SQLite.exec(database, "ALTER TABLE documents ADD COLUMN about TEXT")
+        bridgeVersions()
         v2Ready = createSchemaV2()
-        if v2Ready { runOneTimeFixes() }
+        v2Copied = metaValue("v2_copied") == "1"
+        SQLite.migrate(database, "content.db", migrations)
+        contentless = v2Ready && !SQLite.hasColumn(database, "search_fts", "path")
         SQLite.excludeFromBackup(location)
     }
 
-    /// Corrections to what earlier builds stored, each run once (a `meta` key
-    /// records it).
+    /// Before migrations, `user_version` said whether the v2 index copy had
+    /// finished (2) or not (1). Once: that moves to `meta`, and the version
+    /// starts counting migrations.
+    private func bridgeVersions() {
+        SQLite.exec(database, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        guard metaValue("versions") == nil else { return }
+        let legacy = SQLite.userVersion(database)
+        SQLite.exec(database, "BEGIN")
+        setMeta("v2_copied", legacy >= 2 ? "1" : "0")
+        SQLite.exec(database, "PRAGMA user_version = 0")
+        setMeta("versions", "1")
+        SQLite.exec(database, "COMMIT")
+    }
+
+    /// The layout's changes, in order (`SQLite.migrate`). Each is harmless on
+    /// a database that already has it.
+    private var migrations: [SQLite.Migration] {
+        [
+            SQLite.Migration(version: 1, name: "documents.headings") {
+                SQLite.addColumn($0, "documents", "headings", "TEXT")
+            },
+            // A photo's one-line description from Pip's vision (`PhotoCaptions`).
+            // NULL = not captioned yet, '' = looked at, nothing to say (too small).
+            SQLite.Migration(version: 2, name: "documents.caption") {
+                SQLite.addColumn($0, "documents", "caption", "TEXT")
+            },
+            // A document's one-line description from Pip's brain (`DocumentNotes`).
+            SQLite.Migration(version: 3, name: "documents.about") {
+                SQLite.addColumn($0, "documents", "about", "TEXT")
+            },
+            // The kind of file it is ("research paper", "rent receipt"), as Pip
+            // files it — so a search for a kind goes straight to its group.
+            // `kind_by`: 'pip' (his brain said so) or 'line' (read from his
+            // description until he looks again, `DocumentNotes`).
+            SQLite.Migration(version: 4, name: "documents.kind") {
+                SQLite.addColumn($0, "documents", "kind", "TEXT")
+                    && SQLite.addColumn($0, "documents", "kind_by", "TEXT")
+                    && SQLite.exec($0, "CREATE INDEX IF NOT EXISTS documents_kind ON documents(kind)")
+            },
+            SQLite.Migration(version: 5, name: "one-time fixes") { [unowned self] _ in
+                guard v2Ready else { return false }
+                runOneTimeFixes()
+                return true
+            },
+            // search_fts kept its own copy of every document's text (37 MB);
+            // it becomes an index only (contentless, rows deleted by id), and
+            // `search_rows` says which file each row is. About 2 s for 33k rows.
+            SQLite.Migration(version: 6, name: "search_fts without its copy of the text") { [unowned self] db in
+                guard v2Ready else { return false }
+                guard SQLite.exec(db, "CREATE TABLE IF NOT EXISTS search_rows (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL)")
+                else { return false }
+                guard SQLite.hasColumn(db, "search_fts", "path") else { return true }   // done already
+                let ok = SQLite.exec(db, "DROP TABLE IF EXISTS search_fts_new")
+                    && SQLite.exec(db, "CREATE VIRTUAL TABLE search_fts_new USING fts5(" + Self.searchColumns + ")")
+                    && SQLite.exec(db, "INSERT OR IGNORE INTO search_rows (path) SELECT path FROM search_fts")
+                    && SQLite.exec(db, """
+                        INSERT INTO search_fts_new (rowid, name, title, headings, text)
+                        SELECT r.id, s.name, s.title, s.headings, s.text FROM search_fts s
+                        JOIN search_rows r ON r.path = s.path
+                        WHERE s.rowid IN (SELECT min(rowid) FROM search_fts GROUP BY path)
+                        """)
+                    && SQLite.exec(db, "DROP TABLE IF EXISTS search_vocab")
+                    && SQLite.exec(db, "DROP TABLE search_fts")
+                    && SQLite.exec(db, "ALTER TABLE search_fts_new RENAME TO search_fts")
+                    && SQLite.exec(db, "CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, 'row')")
+                guard ok else { return false }
+                setMeta("search_fts_layout", Self.contentlessLayout)
+                // The space the copy took is given back once, while the Mac is idle (`vacuumIfPending`).
+                setMeta("vacuum_pending", "1")
+                return true
+            },
+            // The v1 word index over documents' text (26 MB): every search
+            // goes through search_fts now.
+            SQLite.Migration(version: 7, name: "drop documents_fts") { [unowned self] db in
+                let ok = ["documents_ai", "documents_ad", "documents_au"]
+                    .allSatisfy { SQLite.exec(db, "DROP TRIGGER IF EXISTS \($0)") }
+                    && SQLite.exec(db, "DROP TABLE IF EXISTS documents_fts")
+                if ok { setMeta("vacuum_pending", "1") }
+                return ok
+            },
+            // Kinds in one spelling: accents folded, "cv" → "resume" (`Kinds.normalise`).
+            SQLite.Migration(version: 8, name: "kinds in one spelling") { [unowned self] _ in
+                var changes: [(from: String, to: String)] = []
+                for (kind, _) in kindCounts() {
+                    if let tidy = Kinds.normalise(kind), tidy != kind { changes.append((kind, tidy)) }
+                }
+                for change in changes {
+                    var statement: OpaquePointer?
+                    defer { sqlite3_finalize(statement) }
+                    guard sqlite3_prepare_v2(database, "UPDATE documents SET kind = ? WHERE kind = ?", -1, &statement, nil) == SQLITE_OK
+                    else { return false }
+                    SQLite.bind(statement, 1, change.to)
+                    SQLite.bind(statement, 2, change.from)
+                    guard sqlite3_step(statement) == SQLITE_DONE else { return false }
+                }
+                ActivityLog.write(.search, "kinds: \(changes.count) respelled"
+                                  + changes.prefix(5).map { " (\($0.from) → \($0.to))" }.joined())
+                return true
+            },
+            // Words the old stemming cut ("sett", "train", "mapp") made whole
+            // from each document's own description.
+            SQLite.Migration(version: 9, name: "kinds with whole words") { [unowned self] _ in
+                var rows: [(path: String, kind: String, about: String)] = []
+                var read: OpaquePointer?
+                guard sqlite3_prepare_v2(database, "SELECT path, kind, about FROM documents WHERE kind != '' AND about != ''",
+                                         -1, &read, nil) == SQLITE_OK else { return false }
+                while sqlite3_step(read) == SQLITE_ROW {
+                    if let path = SQLite.string(read, 0), let kind = SQLite.string(read, 1), let about = SQLite.string(read, 2) {
+                        rows.append((path, kind, about))
+                    }
+                }
+                sqlite3_finalize(read)
+                var fixed: [(path: String, from: String, to: String)] = []
+                for row in rows {
+                    let whole = Kinds.repaired(row.kind, from: row.about)
+                    if whole != row.kind { fixed.append((row.path, row.kind, whole)) }
+                }
+                var write: OpaquePointer?
+                defer { sqlite3_finalize(write) }
+                guard sqlite3_prepare_v2(database, "UPDATE documents SET kind = ? WHERE path = ?", -1, &write, nil) == SQLITE_OK
+                else { return false }
+                for fix in fixed {
+                    sqlite3_reset(write)
+                    SQLite.bind(write, 1, fix.to)
+                    SQLite.bind(write, 2, fix.path)
+                    guard sqlite3_step(write) == SQLITE_DONE else { return false }
+                }
+                let distinct = Set(fixed.map { "\($0.from) → \($0.to)" })
+                ActivityLog.write(.search, "kinds: \(fixed.count) made whole (\(distinct.count) kinds), e.g. "
+                                  + distinct.sorted().prefix(6).joined(separator: ", "))
+                return true
+            },
+            // "In Desktop or Downloads" by folder, not by matching path text.
+            SQLite.Migration(version: 10, name: "files_folder index") { [unowned self] db in
+                guard v2Ready else { return false }
+                return SQLite.exec(db, "CREATE INDEX IF NOT EXISTS files_folder ON files(folder)")
+            },
+        ]
+    }
+
+    /// `column` (a folder path) is one of these home folders or inside it,
+    /// as a range the files_folder index can use (a folder inside Desktop is
+    /// "~/Desktop/…": from "~/Desktop/" up to "~/Desktop0").
+    private static func inHome(_ column: String, _ folders: [String]) -> String {
+        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
+        return "(" + folders.map { name in
+            let root = "\(home)/\(name)"
+            return "\(column) = '\(root)' OR (\(column) >= '\(root)/' AND \(column) < '\(root)0')"
+        }.joined(separator: " OR ") + ")"
+    }
+
+    /// A `documents.path` in these home folders or below: by the files
+    /// table's folder — or, for the few documents the folder scan never
+    /// recorded (a GIF in a project folder), by the path as before.
+    private static func pathIn(_ folders: [String]) -> String {
+        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
+        let byPath = folders.map { "path LIKE '\(home)/\($0)/%'" }.joined(separator: " OR ")
+        return "(path IN (SELECT path FROM files WHERE \(inHome("folder", folders))) "
+            + "OR (path NOT IN (SELECT path FROM files) AND (\(byPath))))"
+    }
+
+    /// search_fts's columns as an index only: rows are `search_rows` ids.
+    private static let searchColumns = "name, title, headings, text, content = '', contentless_delete = 1, "
+        + "tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3'"
+    private static let contentlessLayout = "contentless:name,title,headings,text"
+
+    /// search_fts holds no text (migration 6): rows by `search_rows` id.
+    /// False on the old layout, which keeps working if that migration fails.
+    private var contentless = false
+
+    /// The search_fts row id for a path, made if new.
+    private func searchRow(for path: String, create: Bool) -> Int64? {
+        guard let database else { return nil }
+        if create {
+            var insert: OpaquePointer?
+            defer { sqlite3_finalize(insert) }
+            if sqlite3_prepare_v2(database, "INSERT OR IGNORE INTO search_rows (path) VALUES (?)", -1, &insert, nil) == SQLITE_OK {
+                SQLite.bind(insert, 1, path)
+                sqlite3_step(insert)
+            }
+        }
+        var select: OpaquePointer?
+        defer { sqlite3_finalize(select) }
+        guard sqlite3_prepare_v2(database, "SELECT id FROM search_rows WHERE path = ?", -1, &select, nil) == SQLITE_OK
+        else { return nil }
+        SQLite.bind(select, 1, path)
+        return sqlite3_step(select) == SQLITE_ROW ? sqlite3_column_int64(select, 0) : nil
+    }
+
+    /// Gives back the space a migration freed, once, when the Mac is idle
+    /// (VACUUM rewrites the whole file: seconds, never at launch).
+    func vacuumIfPending() {
+        open()
+        guard ready, let database, metaValue("vacuum_pending") == "1" else { return }
+        // Read from disk each time (a URL's resource values are cached).
+        let size = { ((try? FileManager.default.attributesOfItem(atPath: self.location.path))?[.size] as? NSNumber)?.intValue ?? 0 }
+        let before = size()
+        SQLite.exec(database, "PRAGMA wal_checkpoint(TRUNCATE)")
+        guard SQLite.exec(database, "VACUUM") else {
+            ActivityLog.write(.error, "content.db: vacuum failed — \(String(cString: sqlite3_errmsg(database)))")
+            return
+        }
+        setMeta("vacuum_pending", "0")
+        let after = size()
+        ActivityLog.write(.search, String(format: "content.db: vacuumed, %.1f MB → %.1f MB",
+                                          Double(before) / 1_048_576, Double(after) / 1_048_576))
+    }
+
+    /// Whether the v2 index holds every stored document yet (`migrateStep`).
+    private var v2Copied = false
+
+    /// Corrections to what earlier builds stored, each guarded by its own
+    /// `meta` key (they predate migrations), so running them again is harmless.
     private func runOneTimeFixes() {
         // Searches used to read whatever Spotlight returned, ~/Library
         // included. The tables above are cleared on every open; these are the
@@ -133,36 +342,6 @@ actor ContentStore {
                 read_at  REAL NOT NULL
             )
             """,
-            // Not contentless: callers need the text back for scoring and snippets.
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-                text,
-                content = 'documents',
-                content_rowid = 'id',
-                tokenize = 'unicode61'
-            )
-            """,
-            // External-content FTS5 doesn't track its table by itself; these
-            // three keep the index honest. The 'delete' command is how FTS5 is
-            // told to retract a row it can no longer see.
-            """
-            CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-                INSERT INTO documents_fts(rowid, text) VALUES (new.id, new.text);
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-                INSERT INTO documents_fts(documents_fts, rowid, text)
-                VALUES ('delete', old.id, old.text);
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-                INSERT INTO documents_fts(documents_fts, rowid, text)
-                VALUES ('delete', old.id, old.text);
-                INSERT INTO documents_fts(rowid, text) VALUES (new.id, new.text);
-            END
-            """,
             "CREATE INDEX IF NOT EXISTS documents_read_at ON documents(read_at)",
             // Files read that gave nothing; keeps the indexer from re-reading them.
             """
@@ -193,16 +372,17 @@ actor ContentStore {
 
     /// Version 2: `files` (every file in the usual folders), `search_fts` (name
     /// ×8, title ×6, headings ×4, text ×1) and `names_trigram` (any part of a
-    /// name). `user_version` 2 = migration from v1 finished.
+    /// name). `meta.v2_copied` = 1 once every v1 document is copied in.
     private func createSchemaV2() -> Bool {
         // The index's columns changed (headings were added). FTS5 tables
         // can't gain a column, so an older one is dropped and rebuilt from
         // the stored documents by the normal migration.
         SQLite.exec(database, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         let layout = "name,title,headings,text"
-        if metaValue("search_fts_layout") != layout {
+        let stored = metaValue("search_fts_layout")
+        if stored != layout && stored != Self.contentlessLayout {
             SQLite.exec(database, "DROP TABLE IF EXISTS search_fts")
-            SQLite.exec(database, "PRAGMA user_version = 1")
+            setMeta("v2_copied", "0")
             setMeta("v2_migrated_upto", "0")
             setMeta("search_fts_layout", layout)
         }
@@ -235,6 +415,9 @@ actor ContentStore {
             )
             """,
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
+            // Every word the index holds and how many files hold it — what a
+            // typo is corrected against (`correction`).
+            "CREATE VIRTUAL TABLE IF NOT EXISTS search_vocab USING fts5vocab(search_fts, 'row')",
         ]
         for statement in statements where !SQLite.exec(database, statement) { return false }
         return true
@@ -268,12 +451,23 @@ actor ContentStore {
     private func indexV2(path: String, title: String?, headings: String? = nil, text: String) {
         guard v2Ready, let database else { return }
         let name = Self.searchableName(path)
-        deleteV2(path: path)
+        deleteV2(path: path, keepRow: true)
         var insert: OpaquePointer?
         defer { sqlite3_finalize(insert) }
-        if sqlite3_prepare_v2(database,
-                              "INSERT INTO search_fts (name, title, headings, text, path) VALUES (?, ?, ?, ?, ?)",
-                              -1, &insert, nil) == SQLITE_OK {
+        if contentless {
+            if let row = searchRow(for: path, create: true),
+               sqlite3_prepare_v2(database, "INSERT INTO search_fts (rowid, name, title, headings, text) VALUES (?, ?, ?, ?, ?)",
+                                  -1, &insert, nil) == SQLITE_OK {
+                sqlite3_bind_int64(insert, 1, row)
+                SQLite.bind(insert, 2, name)
+                SQLite.bind(insert, 3, title ?? "")
+                SQLite.bind(insert, 4, headings ?? "")
+                SQLite.bind(insert, 5, text)
+                sqlite3_step(insert)
+            }
+        } else if sqlite3_prepare_v2(database,
+                                     "INSERT INTO search_fts (name, title, headings, text, path) VALUES (?, ?, ?, ?, ?)",
+                                     -1, &insert, nil) == SQLITE_OK {
             SQLite.bind(insert, 1, name)
             SQLite.bind(insert, 2, title ?? "")
             SQLite.bind(insert, 3, headings ?? "")
@@ -291,9 +485,14 @@ actor ContentStore {
         }
     }
 
-    private func deleteV2(path: String) {
+    /// `keepRow`: indexed again at once (same `search_rows` id).
+    private func deleteV2(path: String, keepRow: Bool = false) {
         guard v2Ready, let database else { return }
-        for table in ["search_fts", "names_trigram"] {
+        if contentless, let row = searchRow(for: path, create: false) {
+            SQLite.exec(database, "DELETE FROM search_fts WHERE rowid = \(row)")
+            if !keepRow { SQLite.exec(database, "DELETE FROM search_rows WHERE id = \(row)") }
+        }
+        for table in contentless ? ["names_trigram"] : ["search_fts", "names_trigram"] {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             guard sqlite3_prepare_v2(database, "DELETE FROM \(table) WHERE path = ?",
@@ -305,9 +504,12 @@ actor ContentStore {
 
     /// Records files in the usual folders, read or not, so names are searchable.
     /// A renamed or moved file (same inode) keeps its text and vectors.
-    func recordFiles(_ entries: [(path: String, modified: Date?, size: Int?)]) {
+    /// Returns the old paths carried over to new ones.
+    @discardableResult
+    func recordFiles(_ entries: [(path: String, modified: Date?, size: Int?)]) -> Set<String> {
         open()
-        guard v2Ready, let database, !entries.isEmpty else { return }
+        var renamed = Set<String>()
+        guard v2Ready, let database, !entries.isEmpty else { return renamed }
         SQLite.exec(database, "BEGIN")
         // One prepared lookup reused for every file: most are unchanged, and
         // for those this is the only work done.
@@ -324,11 +526,18 @@ actor ContentStore {
             // New or changed: only now ask the disk for its identity.
             let inode = (try? FileManager.default.attributesOfItem(atPath: entry.path))
                 .flatMap { ($0[.systemFileNumber] as? NSNumber)?.uint64Value }
-            // Same inode, old path gone, same date: the same file renamed.
+            // Same inode, old path gone, same date and size: the same file
+            // renamed. Another date or size is a new file that was given the
+            // old one's inode — read as new.
             if known == nil, let inode, let old = pathWithInode(inode, other: entry.path),
-               !FileManager.default.fileExists(atPath: old.path),
-               abs(old.mtime - stamp) < 1 {
-                rename(from: old.path, to: entry.path)
+               !FileManager.default.fileExists(atPath: old.path) {
+                if abs(old.mtime - stamp) < 1, entry.size == nil || old.size == Int64(entry.size ?? 0) {
+                    rename(from: old.path, to: entry.path)
+                    renamed.insert(old.path)
+                } else {
+                    ActivityLog.write(.search, "inode reused: \((entry.path as NSString).lastPathComponent) is a new file, "
+                                      + "not \((old.path as NSString).lastPathComponent) renamed")
+                }
             }
 
             var upsert: OpaquePointer?
@@ -364,27 +573,29 @@ actor ContentStore {
             }
         }
         SQLite.exec(database, "COMMIT")
+        return renamed
     }
 
-    private func pathWithInode(_ inode: UInt64, other path: String) -> (path: String, mtime: Double)? {
+    private func pathWithInode(_ inode: UInt64, other path: String) -> (path: String, mtime: Double, size: Int64)? {
         guard let database else { return nil }
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(database, "SELECT path, mtime FROM files WHERE inode = ? AND path != ? LIMIT 1",
+        guard sqlite3_prepare_v2(database, "SELECT path, mtime, size FROM files WHERE inode = ? AND path != ? LIMIT 1",
                                  -1, &statement, nil) == SQLITE_OK else { return nil }
         sqlite3_bind_int64(statement, 1, Int64(bitPattern: inode))
         SQLite.bind(statement, 2, path)
         guard sqlite3_step(statement) == SQLITE_ROW, let found = SQLite.string(statement, 0) else { return nil }
-        return (found, sqlite3_column_double(statement, 1))
+        return (found, sqlite3_column_double(statement, 1), sqlite3_column_int64(statement, 2))
     }
 
     /// Moves everything known about `old` to `new`: the stored text, the
     /// index rows (re-made with the new name), and the meaning vectors.
     private func rename(from old: String, to new: String) {
         guard let database else { return }
-        for sql in ["UPDATE documents SET path = ? WHERE path = ?",
-                    "UPDATE unreadable SET path = ? WHERE path = ?",
-                    "UPDATE files SET path = ?, name = ? WHERE path = ?"] {
+        // OR REPLACE: a row the indexer already made for the new path gives way.
+        for sql in ["UPDATE OR REPLACE documents SET path = ? WHERE path = ?",
+                    "UPDATE OR REPLACE unreadable SET path = ? WHERE path = ?",
+                    "UPDATE OR REPLACE files SET path = ?, name = ? WHERE path = ?"] {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { continue }
@@ -403,8 +614,7 @@ actor ContentStore {
         ActivityLog.write(.search, "renamed in the index: \((old as NSString).lastPathComponent) → \((new as NSString).lastPathComponent)")
         Task {
             await SemanticIndex.shared.rename(from: old, to: new)
-            // A photo's vector is quick to make again under its new name.
-            await PhotoVectors.shared.forget(path: old)
+            await PhotoVectors.shared.rename(from: old, to: new)
         }
     }
 
@@ -440,7 +650,7 @@ actor ContentStore {
     func migrateStep(limit: Int = 400) -> Bool {
         open()
         guard v2Ready, let database else { return false }
-        if SQLite.userVersion(database) >= 2 { return true }
+        if v2Copied { return true }
         let after = Int64(metaValue("v2_migrated_upto") ?? "0") ?? 0
 
         var statement: OpaquePointer?
@@ -457,7 +667,8 @@ actor ContentStore {
         sqlite3_finalize(statement)
 
         guard let last = rows.last else {
-            SQLite.exec(database, "PRAGMA user_version = 2")
+            setMeta("v2_copied", "1")
+            v2Copied = true
             ActivityLog.write(.search, "content store: v2 index ready")
             return true
         }
@@ -469,13 +680,16 @@ actor ContentStore {
     }
 
     /// Search over what documents say (title, headings, text; not the name):
-    /// exact phrase first, then any word. Nil until v2 is ready.
-    private func searchV2(words: [String], limit: Int) -> [Hit]? {
-        guard v2Ready, SQLite.userVersion(database) >= 2, let database else { return nil }
+    /// exact phrase first, then any word. Nil without the v2 index.
+    private func searchV2(words: [String], limit: Int, extensions: Set<String> = []) -> [Hit]? {
+        // While an old install's v1 documents are still being copied in
+        // (`migrateStep`), what's copied so far.
+        guard v2Ready, let database else { return nil }
         var hits: [Hit] = []
         var seen = Set<String>()
 
-        func run(_ sql: String, _ expression: String, phrase: Bool, boost: Double, allWords: Bool = false) {
+        func run(_ sql: String, _ expression: String, phrase: Bool, boost: Double, allWords: Bool = false,
+                 near: Bool = false) {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return }
@@ -488,33 +702,57 @@ actor ContentStore {
                 hits.append(Hit(url: URL(fileURLWithPath: path),
                                 title: (title?.isEmpty ?? true) ? nil : title,
                                 score: -sqlite3_column_double(statement, 2) + boost,
-                                phrase: phrase, allWords: phrase || allWords))
+                                phrase: phrase, allWords: phrase || allWords, near: phrase || near))
             }
         }
-        let ranked = """
+        // "pdf about transformers": only that format, or a thousand code
+        // docs fill the limit before the paper. Extensions come from
+        // `QueryParse`'s map — letters and digits only.
+        let formats = extensions.map { $0.filter { $0.isLetter || $0.isNumber } }.filter { !$0.isEmpty }
+        let pathColumn = contentless ? "r.path" : "path"
+        let scoped = formats.isEmpty ? ""
+            : " AND (" + formats.map { "lower(\(pathColumn)) LIKE '%.\($0)'" }.joined(separator: " OR ") + ")"
+        // Contentless: the path from `search_rows`, the title from `documents`.
+        let ranked = contentless ? """
+            SELECT r.path, d.title, bm25(search_fts, 0.0, 6.0, 4.0, 1.0)
+            FROM search_fts JOIN search_rows r ON r.id = search_fts.rowid
+            LEFT JOIN documents d ON d.path = r.path
+            WHERE search_fts MATCH ?\(scoped)
+            ORDER BY bm25(search_fts, 0.0, 6.0, 4.0, 1.0) LIMIT ?
+            """ : """
             SELECT path, title, bm25(search_fts, 0.0, 6.0, 4.0, 1.0)
-            FROM search_fts WHERE search_fts MATCH ?
+            FROM search_fts WHERE search_fts MATCH ?\(scoped)
             ORDER BY bm25(search_fts, 0.0, 6.0, 4.0, 1.0) LIMIT ?
             """
         let cleaned = words.map { $0.filter { $0.isLetter || $0.isNumber } }.filter { !$0.isEmpty }
         guard !cleaned.isEmpty else { return [] }
 
         let content = "{title headings text} : "
+        // Each word as a prefix (it arrives stemmed), and "snowy" as "snow" too.
+        func term(_ word: String) -> String {
+            Tokens.plainForm(word).map { "(\"\(word)\"* OR \"\($0)\")" } ?? "\"\(word)\"*"
+        }
         // 1. The words together, in order — a strong sign.
         if cleaned.count >= 2 {
             run(ranked, content + "\"" + cleaned.joined(separator: " ") + "\"", phrase: true, boost: 50)
         }
-        // 2. Every word, anywhere in the document — the paper says "attention",
+        // 2. Every word, close together — a caption ("headphones, microphone,
+        // studio") over a 5 MB word list that holds each somewhere.
+        if cleaned.count >= 2 {
+            let near = "NEAR(" + cleaned.map { "\"\($0)\"*" }.joined(separator: " ") + ", 12)"
+            run(ranked, content + near, phrase: false, boost: 35, allWords: true, near: true)
+        }
+        // 3. Every word, anywhere in the document — the paper says "attention",
         // "all", "you" and "need"; a file of attention code mostly says one of
         // them, many times, which is all an any-word match can see.
         if cleaned.count >= 2 {
             // Prefix terms: query words arrive stemmed ("augment"), and the
             // prefix is what finds "augmented" and "augmentations".
-            let every = cleaned.map { "\"\($0)\"*" }.joined(separator: " AND ")
+            let every = cleaned.map(term).joined(separator: " AND ")
             run(ranked, content + "(" + every + ")", phrase: false, boost: 25, allWords: true)
         }
         // Any of the words, each a prefix (half-typed or a stem).
-        let terms = cleaned.map { "\"\($0)\"*" }
+        let terms = cleaned.map(term)
         run(ranked, content + "(" + terms.joined(separator: " OR ") + ")", phrase: false, boost: 0,
             allWords: cleaned.count == 1)
         return Array(hits.prefix(limit))
@@ -712,7 +950,7 @@ actor ContentStore {
     /// Saves a description and puts it at the front of the document's
     /// searchable text. Returns the new text (for the meaning index), or nil
     /// if the file changed or went away meanwhile.
-    func setAbout(path: String, modified: Date, about: String) -> (title: String?, text: String)? {
+    func setAbout(path: String, modified: Date, about: String, kind: String?) -> (title: String?, text: String)? {
         open()
         guard ready, let database else { return nil }
         var read: OpaquePointer?
@@ -731,11 +969,16 @@ actor ContentStore {
         if !about.isEmpty { text = Self.aboutLine(about) + text }
         var write: OpaquePointer?
         defer { sqlite3_finalize(write) }
-        guard sqlite3_prepare_v2(database, "UPDATE documents SET about = ?, text = ? WHERE path = ?",
+        guard sqlite3_prepare_v2(database, "UPDATE documents SET about = ?, text = ?, kind = ?, kind_by = ? WHERE path = ?",
                                  -1, &write, nil) == SQLITE_OK else { return nil }
         SQLite.bind(write, 1, about)
         SQLite.bind(write, 2, text)
-        SQLite.bind(write, 3, path)
+        if let kind, !kind.isEmpty {
+            SQLite.bind(write, 3, kind); SQLite.bind(write, 4, "pip")
+        } else {
+            sqlite3_bind_null(write, 3); sqlite3_bind_null(write, 4)
+        }
+        SQLite.bind(write, 5, path)
         sqlite3_step(write)
         indexV2(path: path, title: title, headings: headings, text: text)
         return (title, text)
@@ -745,6 +988,8 @@ actor ContentStore {
     /// Pip's description, its own title, a photo's caption, the start of its text.
     struct Note: Sendable {
         var about: String?
+        /// The kind Pip filed it under ("research paper"), normalised (`Kinds`).
+        var kind: String?
         var title: String?
         var caption: String?
         var opening: String
@@ -756,7 +1001,7 @@ actor ContentStore {
         var out: [String: Note] = [:]
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(database, "SELECT about, title, caption, substr(text, 1, 400) FROM documents WHERE path = ?",
+        guard sqlite3_prepare_v2(database, "SELECT about, title, caption, substr(text, 1, 400), kind FROM documents WHERE path = ?",
                                  -1, &statement, nil) == SQLITE_OK else { return [:] }
         for path in paths {
             sqlite3_reset(statement)
@@ -767,6 +1012,7 @@ actor ContentStore {
                 if let end = opening.firstIndex(of: "\n") { opening = String(opening[opening.index(after: end)...]) }
             }
             out[path] = Note(about: SQLite.string(statement, 0).flatMap { $0.isEmpty ? nil : $0 },
+                             kind: SQLite.string(statement, 4).flatMap { $0.isEmpty ? nil : $0 },
                              title: SQLite.string(statement, 1), caption: SQLite.string(statement, 2),
                              opening: opening)
         }
@@ -776,11 +1022,9 @@ actor ContentStore {
     /// Photos read but not captioned: Desktop and Downloads first, newest
     /// first, screenshots last.
     private var uncaptionedSQL: String {
-        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
-        let folders = ["Desktop", "Documents", "Downloads", "Pictures"]
-            .map { "path LIKE '\(home)/\($0)/%'" }.joined(separator: " OR ")
-        return "FROM documents WHERE caption IS NULL AND mtime <> -1 AND \(Self.imageSQL) "
-            + "AND (\(folders)) AND path NOT LIKE '%.photoslibrary/%'"
+        "FROM documents WHERE caption IS NULL AND mtime <> -1 AND \(Self.imageSQL) "
+            + "AND \(Self.pathIn(["Desktop", "Documents", "Downloads", "Pictures"])) "
+            + "AND path NOT LIKE '%.photoslibrary/%'"
     }
 
     func uncaptionedPhotos(limit: Int) -> [(path: String, modified: Date)] {
@@ -790,9 +1034,8 @@ actor ContentStore {
         defer { sqlite3_finalize(statement) }
         let screenshot = "(lower(path) LIKE '%/screenshot%' OR lower(path) LIKE '%/screen shot%' "
             + "OR lower(path) LIKE '%/cleanshot%')"
-        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
-        let folder = "(CASE WHEN path LIKE '\(home)/Desktop/%' OR path LIKE '\(home)/Downloads/%' THEN 0 "
-            + "WHEN path LIKE '\(home)/Documents/%' THEN 1 ELSE 2 END)"
+        let folder = "(CASE WHEN \(Self.pathIn(["Desktop", "Downloads"])) THEN 0 "
+            + "WHEN \(Self.pathIn(["Documents"])) THEN 1 ELSE 2 END)"
         let sql = "SELECT path, mtime \(uncaptionedSQL) ORDER BY \(folder), \(screenshot), mtime DESC LIMIT \(limit)"
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
         var out: [(path: String, modified: Date)] = []
@@ -852,14 +1095,12 @@ actor ContentStore {
     func pictureFiles() -> [(path: String, modified: Double)] {
         open()
         guard ready, v2Ready, let database else { return [] }
-        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "''")
         let sql = """
             SELECT path, mtime FROM files
              WHERE kind IN ('png','jpg','jpeg','heic','webp') AND path NOT LIKE '%.photoslibrary/%'
-               AND (path LIKE '\(home)/Desktop/%' OR path LIKE '\(home)/Downloads/%'
-                    OR path LIKE '\(home)/Documents/%' OR path LIKE '\(home)/Pictures/%')
-             ORDER BY CASE WHEN path LIKE '\(home)/Desktop/%' OR path LIKE '\(home)/Downloads/%' THEN 0
-                           WHEN path LIKE '\(home)/Documents/%' THEN 1 ELSE 2 END, mtime DESC
+               AND \(Self.inHome("folder", ["Desktop", "Downloads", "Documents", "Pictures"]))
+             ORDER BY CASE WHEN \(Self.inHome("folder", ["Desktop", "Downloads"])) THEN 0
+                           WHEN \(Self.inHome("folder", ["Documents"])) THEN 1 ELSE 2 END, mtime DESC
             """
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
@@ -939,37 +1180,199 @@ actor ContentStore {
     }
 
     /// Everything read that matches, ranked by BM25.
-    func search(words: [String], limit: Int = 60) -> [Hit] {
+    /// Only files of these formats (v2 index only; empty = any).
+    func search(words: [String], limit: Int = 60, extensions: Set<String>) -> [Hit] {
         open()
-        guard ready, let database, !words.isEmpty else { return [] }
-        if let v2 = searchV2(words: words, limit: limit) { return v2 }
-        guard let expression = matchExpression(words) else { return [] }
+        guard ready, !words.isEmpty else { return [] }
+        return searchV2(words: words, limit: limit, extensions: extensions) ?? []
+    }
 
+    /// Every document filed under this kind: the exact kind ("research
+    /// paper"), or any kind ending in its head ("exam paper" for "paper").
+    func documents(ofKind head: String, limit: Int = 400) -> [(path: String, kind: String)] {
+        open()
+        guard ready, let database, !head.isEmpty else { return [] }
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
-        let sql = """
-            SELECT d.path, d.title, bm25(documents_fts)
-            FROM documents_fts
-            JOIN documents d ON d.id = documents_fts.rowid
-            WHERE documents_fts MATCH ?
-            ORDER BY bm25(documents_fts)
-            LIMIT ?
-            """
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
-        SQLite.bind(statement, 1, expression)
-        sqlite3_bind_int(statement, 2, Int32(limit))
-
-        var hits: [Hit] = []
+        guard sqlite3_prepare_v2(database, "SELECT path, kind FROM documents WHERE kind = ? OR kind LIKE ? LIMIT ?",
+                                 -1, &statement, nil) == SQLITE_OK else { return [] }
+        SQLite.bind(statement, 1, head)
+        SQLite.bind(statement, 2, "% " + head)
+        sqlite3_bind_int(statement, 3, Int32(limit))
+        var out: [(String, String)] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            guard let path = SQLite.string(statement, 0) else { continue }
-            // FTS5 returns bm25 as a negative number, most relevant most
-            // negative, because it sorts ascending by default. Flip it so the
-            // rest of the codebase's "larger is better" holds.
-            hits.append(Hit(url: URL(fileURLWithPath: path),
-                            title: SQLite.string(statement, 1),
-                            score: -sqlite3_column_double(statement, 2)))
+            if let path = SQLite.string(statement, 0), let kind = SQLite.string(statement, 1) { out.append((path, kind)) }
         }
-        return hits
+        return out
+    }
+
+    /// Every kind in use and how many documents are filed under it, most first.
+    func kindCounts() -> [(kind: String, count: Int)] {
+        open()
+        guard ready, let database else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "SELECT kind, count(*) c FROM documents WHERE kind IS NOT NULL AND kind != '' "
+                                 + "GROUP BY kind ORDER BY c DESC", -1, &statement, nil) == SQLITE_OK else { return [] }
+        var out: [(String, Int)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let kind = SQLite.string(statement, 0) { out.append((kind, Int(sqlite3_column_int(statement, 1)))) }
+        }
+        return out
+    }
+
+    /// Descriptions with no kind yet (written before kinds were stored).
+    func describedWithoutKind(limit: Int = 5_000) -> [(path: String, about: String)] {
+        open()
+        guard ready, let database else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "SELECT path, about FROM documents WHERE about != '' AND kind IS NULL LIMIT ?",
+                                 -1, &statement, nil) == SQLITE_OK else { return [] }
+        sqlite3_bind_int(statement, 1, Int32(limit))
+        var out: [(String, String)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let path = SQLite.string(statement, 0), let about = SQLite.string(statement, 1) { out.append((path, about)) }
+        }
+        return out
+    }
+
+    /// Files a document under a kind. `by`: "pip" or "line".
+    func setKinds(_ kinds: [(path: String, kind: String)], by: String) {
+        open()
+        guard ready, let database, !kinds.isEmpty else { return }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "UPDATE documents SET kind = ?, kind_by = ? WHERE path = ?",
+                                 -1, &statement, nil) == SQLITE_OK else { return }
+        SQLite.exec(database, "BEGIN")
+        for (path, kind) in kinds {
+            sqlite3_reset(statement)
+            SQLite.bind(statement, 1, kind); SQLite.bind(statement, 2, by); SQLite.bind(statement, 3, path)
+            sqlite3_step(statement)
+        }
+        SQLite.exec(database, "COMMIT")
+    }
+
+    /// A document whose kind was only read from its description, for Pip
+    /// to look at again: surfaced ones first, then newest.
+    struct ToRecheck: Sendable {
+        var path: String
+        var about: String
+        var title: String?
+        var opening: String
+    }
+
+    func kindsToRecheck(first: [String], limit: Int) -> [ToRecheck] {
+        open()
+        guard ready, let database else { return [] }
+        var out: [ToRecheck] = []
+        func rows(_ sql: String, bind: (OpaquePointer?) -> Void) {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return }
+            bind(statement)
+            while sqlite3_step(statement) == SQLITE_ROW, out.count < limit {
+                guard let path = SQLite.string(statement, 0), !out.contains(where: { $0.path == path }) else { continue }
+                var opening = SQLite.string(statement, 3) ?? ""
+                if opening.hasPrefix("About: "), let end = opening.firstIndex(of: "\n") {
+                    opening = String(opening[opening.index(after: end)...])
+                }
+                out.append(ToRecheck(path: path, about: SQLite.string(statement, 1) ?? "",
+                                     title: SQLite.string(statement, 2), opening: opening))
+            }
+        }
+        let select = "SELECT path, about, title, substr(text, 1, 700) FROM documents WHERE kind_by = 'line' AND about != ''"
+        for path in first where out.count < limit {
+            rows(select + " AND path = ?") { SQLite.bind($0, 1, path) }
+        }
+        if out.count < limit { rows(select + " ORDER BY mtime DESC LIMIT \(limit * 2)") { _ in } }
+        return out
+    }
+
+    func kindsToRecheckCount() -> Int {
+        open()
+        guard ready, let database else { return 0 }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "SELECT count(*) FROM documents WHERE kind_by = 'line'", -1, &statement, nil) == SQLITE_OK,
+              sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    /// Documents Pip described with any of these words, and his line about
+    /// each — for finding files by the kind he said they are.
+    func described(withAny words: [String], limit: Int = 300) -> [(path: String, about: String)] {
+        open()
+        guard ready, let database else { return [] }
+        let usable = words.map { $0.filter { $0.isLetter } }.filter { $0.count >= 3 }
+        guard !usable.isEmpty else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        let sql = "SELECT path, about FROM documents WHERE about != '' AND ("
+            + usable.map { _ in "lower(about) LIKE ?" }.joined(separator: " OR ") + ") LIMIT ?"
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        for (index, word) in usable.enumerated() { SQLite.bind(statement, Int32(index + 1), "%\(word.lowercased())%") }
+        sqlite3_bind_int(statement, Int32(usable.count + 1), Int32(limit))
+        var out: [(String, String)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let path = SQLite.string(statement, 0), let about = SQLite.string(statement, 1) { out.append((path, about)) }
+        }
+        return out
+    }
+
+    /// The word the index holds that `word` was probably meant to be
+    /// ("netwrk" → "network"), or nil when the word (or a word starting with
+    /// it) is in the index already, or nothing close is. Closest first, then
+    /// the one in most files.
+    func correction(for word: String) -> String? {
+        open()
+        guard v2Ready, let database, word.count >= 4, word.allSatisfy(\.isLetter) else { return nil }
+        func rows(_ sql: String, _ bind: (OpaquePointer?) -> Void) -> [(String, Int)] {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+            bind(statement)
+            var out: [(String, Int)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let term = SQLite.string(statement, 0) { out.append((term, Int(sqlite3_column_int(statement, 1)))) }
+            }
+            return out
+        }
+        let lowered = word.lowercased()
+        // Known already: the word, or one it starts (query words arrive stemmed).
+        let next = String(lowered.dropLast()) + String(UnicodeScalar((lowered.unicodeScalars.last?.value ?? 97) + 1)!)
+        if !rows("SELECT term, doc FROM search_vocab WHERE term >= ? AND term < ? LIMIT 1", {
+            SQLite.bind($0, 1, lowered); SQLite.bind($0, 2, next)
+        }).isEmpty { return nil }
+        // Same first letter, similar length; at most one edit for short words, two for long.
+        let first = String(lowered.prefix(1))
+        let after = String(UnicodeScalar((first.unicodeScalars.first?.value ?? 97) + 1)!)
+        let candidates = rows("""
+            SELECT term, doc FROM search_vocab WHERE term >= ? AND term < ?
+              AND length(term) BETWEEN ? AND ? AND doc >= 2
+            """, {
+            SQLite.bind($0, 1, first); SQLite.bind($0, 2, after)
+            sqlite3_bind_int($0, 3, Int32(lowered.count - 2)); sqlite3_bind_int($0, 4, Int32(lowered.count + 3))
+        })
+        let allowed = lowered.count >= 7 ? 2 : 1
+        var best: (term: String, distance: Int, docs: Int)?
+        for (term, docs) in candidates where term.allSatisfy(\.isLetter) {
+            // A stem matches the start of a word: "retentv" is "retentive" cut short.
+            let distance = min(Fuzzy.editDistance(lowered, term),
+                               Fuzzy.editDistance(lowered, String(term.prefix(lowered.count))))
+            guard distance <= allowed else { continue }
+            if best == nil || distance < best!.distance || (distance == best!.distance && docs > best!.docs) {
+                best = (term, distance, docs)
+            }
+        }
+        return best?.term
+    }
+
+    func search(words: [String], limit: Int = 60) -> [Hit] {
+        open()
+        guard ready, !words.isEmpty else { return [] }
+        return searchV2(words: words, limit: limit) ?? []
     }
 
     /// One stored document, for walking the whole store in order.
@@ -1004,21 +1407,6 @@ actor ContentStore {
         return out
     }
 
-    /// A MATCH expression that can't be a syntax error: each term quoted, as a
-    /// prefix, ORed (recall here, precision in the ranker).
-    private func matchExpression(_ words: [String]) -> String? {
-        // No length filter: `Tokens.of` decides what a word is (digits count).
-        let terms = words.compactMap { word -> String? in
-            // Strictly a quoting step: FTS5 treats `-`, `*`, `:`, `^`, `"` and
-            // `(` as operators, so anything that isn't alphanumeric has to go
-            // before the term is wrapped in quotes as a literal.
-            let cleaned = word.filter { $0.isLetter || $0.isNumber }
-            guard !cleaned.isEmpty else { return nil }
-            return "\"\(cleaned)\"*"
-        }
-        return terms.isEmpty ? nil : terms.joined(separator: " OR ")
-    }
-
     // MARK: - Writing
 
     /// Stores an extraction (upsert: a later, deeper read replaces it).
@@ -1045,7 +1433,9 @@ actor ContentStore {
                 read_at = excluded.read_at,
                 headings = excluded.headings,
                 caption = excluded.caption,
-                about = excluded.about
+                about = excluded.about,
+                kind = CASE WHEN excluded.about IS NULL THEN NULL ELSE documents.kind END,
+                kind_by = CASE WHEN excluded.about IS NULL THEN NULL ELSE documents.kind_by END
             """
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return }
         SQLite.bind(statement, 1, path)
@@ -1109,11 +1499,20 @@ actor ContentStore {
         guard ready else { return }
         let overflow = "SELECT id FROM documents WHERE NOT \(Self.imageSQL) "
             + "ORDER BY read_at DESC LIMIT -1 OFFSET \(keep)"
+        // Pruned documents fall back to name-only in the v2 index.
+        var pruned: [String] = []
+        if contentless {
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(database, "SELECT path FROM documents WHERE id IN (\(overflow))", -1, &statement, nil) == SQLITE_OK {
+                while sqlite3_step(statement) == SQLITE_ROW { if let path = SQLite.string(statement, 0) { pruned.append(path) } }
+            }
+            sqlite3_finalize(statement)
+        }
         SQLite.exec(database, "INSERT OR REPLACE INTO unreadable (path, mtime) "
                     + "SELECT path, mtime FROM documents WHERE id IN (\(overflow))")
         SQLite.exec(database, "DELETE FROM documents WHERE id IN (\(overflow))")
-        // Pruned documents fall back to name-only in the v2 index.
-        if v2Ready {
+        for path in pruned { indexV2(path: path, title: nil, text: "") }
+        if v2Ready, !contentless {
             SQLite.exec(database, """
                 UPDATE search_fts SET text = '', title = ''
                 WHERE text != '' AND path NOT IN (SELECT path FROM documents)

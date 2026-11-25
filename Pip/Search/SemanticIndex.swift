@@ -100,11 +100,34 @@ actor SemanticIndex {
         SQLite.exec(database, "PRAGMA journal_mode = WAL")
         SQLite.exec(database, "PRAGMA synchronous = NORMAL")
 
+        // Before migrations, `user_version` held the embedding dimension.
+        // Once: that moves to `meta`, and the version counts migrations.
+        SQLite.exec(database, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        if SQLite.meta(database, "versions") == nil {
+            let legacy = SQLite.userVersion(database)
+            SQLite.exec(database, "BEGIN")
+            SQLite.setMeta(database, "dimension", String(legacy))
+            SQLite.exec(database, "PRAGMA user_version = 0")
+            SQLite.setMeta(database, "versions", "1")
+            SQLite.exec(database, "COMMIT")
+        }
+
         // A new embedding dimension means a new model: start over.
-        if SQLite.userVersion(database) != dimension {
+        if SQLite.meta(database, "dimension") != String(dimension) {
             SQLite.exec(database, "DROP TABLE IF EXISTS passages")
             SQLite.exec(database, "DROP TABLE IF EXISTS pruned")
-            SQLite.exec(database, "PRAGMA user_version = \(dimension)")
+            SQLite.setMeta(database, "dimension", String(dimension))
+        }
+        // Which embedding made the vectors (Apple's English sentence model,
+        // its revision), so a change can be told from the record.
+        if let embedding {
+            let identity = "sentence en, revision \(embedding.revision), \(dimension) dims"
+            if SQLite.meta(database, "embedding") != identity {
+                if let before = SQLite.meta(database, "embedding") {
+                    ActivityLog.write(.search, "semantic.db: embedding was \(before), now \(identity)")
+                }
+                SQLite.setMeta(database, "embedding", identity)
+            }
         }
 
         let schema = [

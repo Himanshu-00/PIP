@@ -4,6 +4,27 @@ import Foundation
 enum Fuzzy {
 
     /// Fraction of query words appearing literally (body text: no fuzziness).
+    /// Edits between two words (insert, delete, replace, or swap two
+    /// neighbours — "netwrok"), for correcting typos.
+    static func editDistance(_ a: String, _ b: String) -> Int {
+        let x = Array(a), y = Array(b)
+        guard !x.isEmpty else { return y.count }
+        guard !y.isEmpty else { return x.count }
+        var table = Array(repeating: Array(repeating: 0, count: y.count + 1), count: x.count + 1)
+        for i in 0...x.count { table[i][0] = i }
+        for j in 0...y.count { table[0][j] = j }
+        for i in 1...x.count {
+            for j in 1...y.count {
+                let cost = x[i - 1] == y[j - 1] ? 0 : 1
+                table[i][j] = min(table[i - 1][j] + 1, table[i][j - 1] + 1, table[i - 1][j - 1] + cost)
+                if i > 1, j > 1, x[i - 1] == y[j - 2], x[i - 2] == y[j - 1] {
+                    table[i][j] = min(table[i][j], table[i - 2][j - 2] + 1)
+                }
+            }
+        }
+        return table[x.count][y.count]
+    }
+
     static func literalOverlap(_ words: [String], in text: String) -> Double {
         guard !words.isEmpty, !text.isEmpty else { return 0 }
         let haystack = text.lowercased()

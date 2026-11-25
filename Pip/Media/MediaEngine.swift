@@ -164,8 +164,12 @@ final class MediaEngine: ObservableObject {
         if nextKind != kind || trackChanged {
             ActivityLog.write(.system, "media: \(track.bundleID) \(Int(track.duration)) s → \(nextKind)")
         }
-        if MediaClassifier.isUnsure(track, longerThan: videoThresholdMinutes) {
-            if trackChanged { waitForDuration() }
+        // A browser's first lengths aren't the video's: Brave said 0 s, then
+        // 300 s, and only 3 s later 3841 s — music flashed up and closed. A
+        // new track there that looks like music waits a few seconds first.
+        let maybeVideo = nextKind == .music && videoThresholdMinutes > 0 && MediaClassifier.isUnlisted(track)
+        if MediaClassifier.isUnsure(track, longerThan: videoThresholdMinutes) || (maybeVideo && (trackChanged || !settled)) {
+            if trackChanged || settleTask == nil { waitForDuration(seconds: maybeVideo ? 4 : 1) }
         } else {
             settle()
         }
@@ -222,11 +226,11 @@ final class MediaEngine: ObservableObject {
         if next != kind { kind = next }
     }
 
-    private func waitForDuration() {
+    private func waitForDuration(seconds: Int = 1) {
         settleTask?.cancel()
         if settled { settled = false }
         settleTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(1))
+            try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
             self?.settle()
         }

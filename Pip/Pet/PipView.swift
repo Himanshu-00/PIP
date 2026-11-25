@@ -361,16 +361,10 @@ struct PipView: View {
                     }
                     ResultRow(url: url, onOpen: onOpen)
                 }
-                if agent.found.count > NotchState.pipMaxResults {
-                    ShowAllRow(count: agent.found.count, inFinder: agent.foundQuery == nil) {
-                        // The search that found these — or, for a list that
-                        // didn't come from a search, the files themselves.
-                        if let query = agent.foundQuery {
-                            search.showAll(for: query)
-                        } else {
-                            NSWorkspace.shared.activateFileViewerSelecting(agent.found)
-                        }
-                    }
+                // Every result, weaker ones too, in the full search panel —
+                // only for a list a search made.
+                if agent.found.count > NotchState.pipMaxResults, let query = agent.foundQuery {
+                    ShowAllRow(count: agent.found.count) { search.showAll(for: query) }
                 }
             }
         }
@@ -813,36 +807,6 @@ private struct AnswerChip: View {
     }
 }
 
-/// "Show all 12 in Search": the rest of what Pip found, in the full panel.
-/// Same height and card as a result row, quieter text.
-private struct ShowAllRow: View {
-
-    let count: Int
-    var inFinder = false
-    var action: () -> Void
-
-    @State private var hovering = false
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Text("Show all \(count) in \(inFinder ? "Finder" : "Search")")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(PipView.secondaryText)
-            Image(systemName: "arrow.up.right")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(PipView.secondaryText.opacity(0.8))
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .frame(height: NotchState.pipResultHeight - 3)
-        .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
-            .fill(Color.white.opacity(hovering ? 0.10 : 0.0)))
-        .frame(height: NotchState.pipResultHeight)
-        .overlay(ClickableArea(onClick: action, onHover: { hovering = $0 }))
-        .animation(.easeOut(duration: 0.12), value: hovering)
-    }
-}
-
 /// Measures a reply the way the view will set it, so the window can be the
 /// right height before the text is drawn.
 @MainActor
@@ -934,5 +898,34 @@ private struct SuggestionChip: View {
         .fixedSize()
         .overlay(ClickableArea(onClick: action, onHover: { hovering = $0 }))
         .animation(.spring(response: 0.25, dampingFraction: 0.9), value: hovering)
+    }
+}
+
+/// "Show all 12 in Search": every result, weaker ones too, in the full
+/// panel. Same height and card as a result row, quieter text.
+private struct ShowAllRow: View {
+
+    let count: Int
+    var action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("Show all \(count) in Search")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(PipView.secondaryText)
+            Image(systemName: "arrow.up.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(PipView.secondaryText.opacity(0.8))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: NotchState.pipResultHeight - 3)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .fill(Color.white.opacity(hovering ? 0.10 : 0.0)))
+        .frame(height: NotchState.pipResultHeight)
+        .overlay(ClickableArea(onClick: action, onHover: { hovering = $0 }))
+        .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }

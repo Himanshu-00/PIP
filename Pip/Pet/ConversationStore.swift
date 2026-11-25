@@ -272,9 +272,12 @@ final class ConversationStore: @unchecked Sendable {
             CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
                 INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content); END;
             """)
-        // Added 2026-11-07: answers the user said were wrong (fails harmlessly
-        // once the column exists).
-        SQLite.exec(database, "ALTER TABLE messages ADD COLUMN disputed INTEGER NOT NULL DEFAULT 0")
+        SQLite.migrate(database, "conversations.db", [
+            // Added 2026-11-07: answers the user said were wrong.
+            SQLite.Migration(version: 1, name: "messages.disputed") {
+                SQLite.addColumn($0, "messages", "disputed", "INTEGER NOT NULL DEFAULT 0")
+            },
+        ])
         return true
     }
 

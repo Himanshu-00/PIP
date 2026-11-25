@@ -988,14 +988,14 @@ final class PetAgent: ObservableObject {
             if Self.isOneStep(text),
                !results.contains(where: { Self.isFruitless($0) || $0.hasPrefix(Self.documentTextMarker) }),
                zip(response.toolCalls, results).allSatisfy({ call, result in
-                   let name = Self.resolve(call.name, call.arguments).name
+                   let name = self.tool(call.name, call.arguments).name
                    // Pictures shown are the whole answer: without this the model
                    // went on, said "I can't show images" and opened Google.
                    return Self.finishes(name, request: text)
                        || (name == "web_search" && result.hasPrefix("Showing ") && result.contains(" in the notch"))
                }) {
                 let said = zip(response.toolCalls, results)
-                    .map { Self.spoken(Self.resolve($0.name, $0.arguments).name, $1) }.joined(separator: " ")
+                    .map { Self.spoken(self.tool($0.name, $0.arguments).name, $1) }.joined(separator: " ")
                 history.append(["role": "assistant", "content": said])
                 reply(said)
                 return
@@ -1199,8 +1199,23 @@ final class PetAgent: ObservableObject {
         }
     }
 
+    /// The tool a call runs. "list all my papers" isn't a request to copy
+    /// them anywhere: the brain reads "all" as collect_files, and told to
+    /// switch, it called it four times and gave up. So unless the user said
+    /// to put files somewhere, it's a search.
+    private func tool(_ called: String, _ given: [String: Any]) -> (name: String, arguments: [String: Any]) {
+        let resolved = Self.resolve(called, given)
+        guard resolved.name == "collect_files",
+              Set(Tokens.of(currentRequest)).isDisjoint(with: ["put", "copy", "move", "collect", "gather", "folder", "into"])
+        else { return resolved }
+        return ("find_files", ["query": resolved.arguments["query"] as? String ?? ""])
+    }
+
     private func perform(_ called: String, _ given: [String: Any], fromUser: Bool = false) async -> String {
-        let (name, arguments) = Self.resolve(called, given)
+        let (name, arguments) = tool(called, given)
+        if name != Self.resolve(called, given).name {
+            ActivityLog.write(.blocked, "\(called) → \(name): the user asked to see files")
+        }
         ActivityLog.write(.tool, "\(name) \(QwenChat.json(arguments))")
         if !fromUser, let stop = loopGuard(name, arguments) {
             ActivityLog.write(.blocked, "\(name): \(stop)")
