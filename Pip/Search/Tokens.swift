@@ -58,6 +58,15 @@ enum Tokens {
         return String(word.dropLast())
     }
 
+    /// The same word spelt the other way ("gray" → "grey"): a caption said
+    /// "grey" and "my pic in dark gray suit" missed it. Spellings only.
+    static func otherSpelling(_ word: String) -> String? { spellings[word] }
+
+    private static let spellings: [String: String] = [
+        "gray": "grey", "grey": "gray", "color": "colour", "colour": "color",
+        "colored": "coloured", "coloured": "colored", "favorite": "favourite", "favourite": "favorite",
+    ]
+
     static func stem(_ word: String) -> String {
         guard !word.contains(where: \.isNumber) else { return word }
         if word.count >= 7, word.hasSuffix("ing") { return String(word.dropLast(3)) }

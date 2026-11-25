@@ -755,7 +755,8 @@ actor ContentStore {
         let content = "{title headings text} : "
         // Each word as a prefix (it arrives stemmed), and "snowy" as "snow" too.
         func term(_ word: String) -> String {
-            Tokens.plainForm(word).map { "(\"\(word)\"* OR \"\($0)\")" } ?? "\"\(word)\"*"
+            if let other = Tokens.otherSpelling(word) { return "(\"\(word)\"* OR \"\(other)\"*)" }
+            return Tokens.plainForm(word).map { "(\"\(word)\"* OR \"\($0)\")" } ?? "\"\(word)\"*"
         }
         // 1. The words together, in order — a strong sign.
         if cleaned.count >= 2 {
