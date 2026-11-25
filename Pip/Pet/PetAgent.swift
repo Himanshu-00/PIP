@@ -1970,8 +1970,12 @@ final class PetAgent: ObservableObject {
 
     private func allowedFile(_ path: String?) -> URL? {
         guard let path, !path.isEmpty else { return nil }
-        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+        var url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
             .resolvingSymlinksInPath()
+        // macOS names screenshots with a narrow space before "PM", which the
+        // brain writes as a plain one: the file in that folder whose name
+        // matches once spaces are plain.
+        if !FileManager.default.fileExists(atPath: url.path), let match = Self.sameNameIgnoringSpaces(url) { url = match }
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path
         guard foundPaths.contains(url.path) || url.path.hasPrefix(home + "/") else { return nil }
@@ -1981,6 +1985,16 @@ final class PetAgent: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    private static func sameNameIgnoringSpaces(_ url: URL) -> URL? {
+        let plain = { (name: String) in
+            String(name.map { "\u{202F}\u{00A0}\u{2009}".contains($0) ? " " : $0 }).lowercased()
+        }
+        let wanted = plain(url.lastPathComponent)
+        let folder = url.deletingLastPathComponent()
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        return names.first { plain($0) == wanted }.map { folder.appendingPathComponent($0) }
+    }
 
     private static func number(_ value: Any?) -> Double? {
         if let number = value as? Double { return number }
