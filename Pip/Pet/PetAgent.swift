@@ -1860,8 +1860,16 @@ final class PetAgent: ObservableObject {
             // all 798), so the user's own words count too.
             var since = text("since").lowercased()
             let said = (query + " " + currentRequest).lowercased()
-            if since.isEmpty, ["just now", "just download", "just saved", "just added", "just got", "recent", "latest",
-                               "newest"].contains(where: said.contains) {
+            // "first 4 latest", "the 3 newest": a count, newest first — the
+            // brain often leaves it out. Then "latest" is which ones, not when.
+            var count = Self.number(arguments["count"]).map { Int($0) } ?? 0
+            if count <= 0, let match = currentRequest.lowercased().range(
+                of: #"\b(?:first|last|latest|newest|recent|top)\s+(\d{1,3})\b|\b(\d{1,3})\s+(?:latest|newest|most recent|recent|last)\b"#,
+                options: .regularExpression) {
+                count = Int(currentRequest.lowercased()[match].filter(\.isNumber)) ?? 0
+            }
+            if since.isEmpty, count <= 0, ["just now", "just download", "just saved", "just added", "just got", "recent",
+                                           "latest", "newest"].contains(where: said.contains) {
                 since = "just now"
             }
             var window: QueryTime.Window?
@@ -1890,6 +1898,15 @@ final class PetAgent: ObservableObject {
                     guard let date = values?.addedToDirectoryDate ?? values?.creationDate else { return false }
                     return date >= window.start && date <= window.end
                 }
+            }
+            // "the 4 latest screenshots": only that many, newest first (it
+            // copied all 7 of the day's when asked for 4).
+            if count > 0, files.count > count {
+                let made = { (file: URL) -> Date in
+                    let values = try? file.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+                    return values?.creationDate ?? values?.contentModificationDate ?? .distantPast
+                }
+                files = Array(files.sorted { made($0) > made($1) }.prefix(count))
             }
             guard !files.isEmpty else {
                 emptyCollects += 1
