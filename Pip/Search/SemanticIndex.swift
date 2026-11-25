@@ -118,6 +118,17 @@ actor SemanticIndex {
             SQLite.exec(database, "DROP TABLE IF EXISTS pruned")
             SQLite.setMeta(database, "dimension", String(dimension))
         }
+        // Which embedding made the vectors (Apple's English sentence model,
+        // its revision), so a change can be told from the record.
+        if let embedding {
+            let identity = "sentence en, revision \(embedding.revision), \(dimension) dims"
+            if SQLite.meta(database, "embedding") != identity {
+                if let before = SQLite.meta(database, "embedding") {
+                    ActivityLog.write(.search, "semantic.db: embedding was \(before), now \(identity)")
+                }
+                SQLite.setMeta(database, "embedding", identity)
+            }
+        }
 
         let schema = [
             """
