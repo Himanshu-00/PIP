@@ -279,14 +279,16 @@ actor ContentStore {
     func vacuumIfPending() {
         open()
         guard ready, let database, metaValue("vacuum_pending") == "1" else { return }
-        let before = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        // Read from disk each time (a URL's resource values are cached).
+        let size = { ((try? FileManager.default.attributesOfItem(atPath: self.location.path))?[.size] as? NSNumber)?.intValue ?? 0 }
+        let before = size()
         SQLite.exec(database, "PRAGMA wal_checkpoint(TRUNCATE)")
         guard SQLite.exec(database, "VACUUM") else {
             ActivityLog.write(.error, "content.db: vacuum failed — \(String(cString: sqlite3_errmsg(database)))")
             return
         }
         setMeta("vacuum_pending", "0")
-        let after = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let after = size()
         ActivityLog.write(.search, String(format: "content.db: vacuumed, %.1f MB → %.1f MB",
                                           Double(before) / 1_048_576, Double(after) / 1_048_576))
     }
