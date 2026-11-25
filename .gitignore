@@ -30,3 +30,7 @@ Screenshots/
 
 Pip 1.0.dmg
 
+
+# PIPL: only the README images are published (the rest are personal screenshots)
+PIPL/*
+!PIPL/readme-*.png

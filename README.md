@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="PIPL/readme-icon.png" width="120" alt="Pip's icon: a glowing glass bubble with two eyes">
+
 # Pip
 
 **An AI that lives in your MacBook notch and knows your files.**<br>
@@ -11,6 +13,8 @@ Fully on-device — nothing you ask, say or keep leaves your Mac.
   <img src="https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white" alt="Swift and SwiftUI">
   <img src="https://img.shields.io/badge/licence-MIT-2EA44F" alt="MIT licence">
 </p>
+
+<img src="PIPL/readme-thinking.png" width="460" alt="Pip thinking in the MacBook notch, an aurora moving inside him">
 
 [Files](#-finds-anything-understands-everything) ·
 [Ask](#-ask-him-anything) ·
@@ -51,6 +55,11 @@ Ask by typing or by voice. He answers in his own voice, with clear layouts for e
 
 ## 📂 Finds anything, understands everything
 
+<div align="center">
+<img src="PIPL/readme-research-papers.png" width="560" alt="Asked to list all research papers, Pip shows six papers named like 2009.01325v3.pdf grouped under Papers, each with his one-line description">
+<br><sub><i>None of these files says "research paper" in its name — Pip read them and knows what they are.</i></sub>
+</div>
+
 **Every document gets a line in Pip's own words** — *"RLHF paper on summarizing from feedback"*, *"Week 7 slides on research methods"* — from its text, name, folder and neighbours.
 
 That line is searchable, shows under each result, and groups results by kind: **Papers**, **Slides**, **Receipts**… named by Pip, not hardcoded.
@@ -59,13 +68,27 @@ That line is searchable, shows under each result, and groups results by kind: **
 - **Answers from inside files** — *"how much rent did I pay last month?"* is read from the documents themselves.
 - **Keeps things tidy** — move, copy, rename, find duplicates, suggest better names, and organise a folder into folders named after what's in them. Everything can be undone.
 
+<div align="center">
+<img src="PIPL/readme-move-files.png" width="520" alt="Pip asking Move these 5 files into PIPL, listing the five newest screenshots from the Desktop, with Allow and Cancel">
+<br><sub><i>"Move the first 5 screenshots from Desktop to PIPL" — he shows exactly what will move, and asks first.</i></sub>
+</div>
+
 ---
 
 ## 💬 Ask him anything
 
+<div align="center">
+<img src="PIPL/readme-explain.png" width="620" alt="Pip explaining transformers in machine learning: a headline, a sentence, three numbered points and an en.wikipedia.org source chip">
+</div>
+
 Ask by typing, or press <kbd>⌥</kbd> <kbd>V</kbd> and talk. Questions, facts and conversions go through a web search first, so answers are current — laid out as a headline, a paragraph and points, with pictures when they help.
 
 Plus the everyday jobs: volume, apps, music, timers, notes, screenshots, and summarising long text you copy. **Click to ask** (⌥⇧A) explains any picture or text on screen in a panel beside it.
+
+<div align="center">
+<img src="PIPL/readme-click-to-ask.png" width="620" alt="Click to ask on a chart in the RetNet paper: Pip's panel explains the inference-cost and scaling-curve charts">
+<br><sub><i>Click to ask on a figure in a PDF.</i></sub>
+</div>
 
 ---
 

@@ -62,7 +62,8 @@ enum PetTools {
               "from": string("Optional: only files lying in this folder (desktop, downloads, documents or a "
                              + "path) — every match there, e.g. all screenshots on the Desktop"),
               "since": string("Optional: only files added since then, e.g. 'just now' (the last hour), "
-                              + "'today', 'this week' — for 'the files I just downloaded'")],
+                              + "'today', 'this week' — for 'the files I just downloaded'"),
+              "count": number("Optional: only this many, the newest first — 'the 4 latest screenshots' → 4")],
              required: ["query", "folder"]),
         tool("search_conversations",
              "Search earlier conversations with the user (yesterday, last week, further back): what they asked, "

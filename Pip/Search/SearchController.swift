@@ -728,6 +728,9 @@ final class SearchController: ObservableObject {
             // "black, suit" side by side).
             if pool[index].wordsNear, !wantsPictures { lift += 10 }
             if wantsPictures, pool[index].isImage { lift += 10 * pool[index].looks }
+            // "My pic": a photo of you is never a screenshot (a GitHub page
+            // captioned "dark mode, gray" isn't you in a dark gray suit).
+            if parsed.me, isScreenshot(pool[index]) { lift -= 20 }
             // A screenshot showing the words goes below documents, unless
             // images were asked for — not a photo whose caption says them.
             if pool[index].isImage, !wantsImages, !pool[index].wordsNear { lift -= 10 }
@@ -761,6 +764,7 @@ final class SearchController: ObservableObject {
         let all = strictWords.allSatisfy { word in
             haystack.contains(word) || haystack.contains { $0.hasPrefix(word) }
                 || Tokens.plainForm(word).map(haystack.contains) == true
+                || Tokens.otherSpelling(word).map(haystack.contains) == true
         }
         coverage[key] = all
         return all
@@ -773,6 +777,7 @@ final class SearchController: ObservableObject {
         candidate.matchesAll = strictWords.allSatisfy { word in
             haystack.contains(word) || haystack.contains { $0.hasPrefix(word) }
                 || Tokens.plainForm(word).map(haystack.contains) == true
+                || Tokens.otherSpelling(word).map(haystack.contains) == true
         }
     }
 
@@ -986,10 +991,12 @@ final class SearchController: ObservableObject {
                 }
             }
         }
+        // Grouped: only the results shown — the cut where good answers end stays.
+        let shown = results
         groupWork?.cancel()
         groupWork = Task { [weak self] in
             let notes = await ContentStore.shared.notes(for: urls.map(\.path))
-            let groups = await ResultGroups.group(urls, query: text)
+            let groups = await ResultGroups.group(shown.map(\.url), query: text)
             guard let self, !Task.isCancelled, self.query == text else { return }
             self.abouts = Dictionary(uniqueKeysWithValues: urls.compactMap { url in notes[url.path]?.about.map { (url, $0) } })
             guard let groups else { return }
@@ -997,12 +1004,10 @@ final class SearchController: ObservableObject {
             var headers: [Int: String] = [:]
             for group in groups {
                 headers[ordered.count] = group.name
-                ordered += group.urls.compactMap { url in ranked.first { $0.url == url } }
+                ordered += group.urls.compactMap { url in shown.first { $0.url == url } }
             }
             let selected = self.results.indices.contains(self.selection) ? self.results[self.selection].url : nil
             self.groupHeaders = headers
-            self.prunedCount = 0
-            self.showsWeak = true
             self.results = ordered
             self.selection = selected.flatMap { url in ordered.firstIndex { $0.url == url } } ?? 0
             ActivityLog.write(.search, "grouped \"\(text)\": " + groups.map { "\($0.name) (\($0.urls.count))" }.joined(separator: ", "))
@@ -1223,6 +1228,14 @@ final class SearchController: ObservableObject {
     private func kindMatch(_ url: URL) -> Int? {
         guard let wanted = askedKind else { return nil }
         return Kinds.match(kinds[url.path], asked: wanted)
+    }
+
+    /// A screen capture: named so by macOS, or captioned as one.
+    private func isScreenshot(_ candidate: Candidate) -> Bool {
+        guard candidate.isImage else { return false }
+        let name = candidate.displayName.lowercased()
+        return name.hasPrefix("screenshot") || name.hasPrefix("screen shot") || name.hasPrefix("cleanshot")
+            || captionWords[candidate.url.path]?.contains("screenshot") == true
     }
 
     /// Could be the kind asked for: filed under it, or a picture whose

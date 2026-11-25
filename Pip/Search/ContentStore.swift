@@ -137,23 +137,48 @@ actor ContentStore {
                 guard SQLite.exec(db, "CREATE TABLE IF NOT EXISTS search_rows (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL)")
                 else { return false }
                 guard SQLite.hasColumn(db, "search_fts", "path") else { return true }   // done already
-                let ok = SQLite.exec(db, "DROP TABLE IF EXISTS search_fts_new")
-                    && SQLite.exec(db, "CREATE VIRTUAL TABLE search_fts_new USING fts5(" + Self.searchColumns + ")")
-                    && SQLite.exec(db, "INSERT OR IGNORE INTO search_rows (path) SELECT path FROM search_fts")
-                    && SQLite.exec(db, """
-                        INSERT INTO search_fts_new (rowid, name, title, headings, text)
-                        SELECT r.id, s.name, s.title, s.headings, s.text FROM search_fts s
-                        JOIN search_rows r ON r.path = s.path
-                        WHERE s.rowid IN (SELECT min(rowid) FROM search_fts GROUP BY path)
-                        """)
-                    && SQLite.exec(db, "DROP TABLE IF EXISTS search_vocab")
-                    && SQLite.exec(db, "DROP TABLE search_fts")
-                    && SQLite.exec(db, "ALTER TABLE search_fts_new RENAME TO search_fts")
-                    && SQLite.exec(db, "CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, 'row')")
-                guard ok else { return false }
+                // Built from documents and files, never from the old index: an
+                // older build may have left that half-copied (23,601 of 33,139
+                // rows once, when 1.0 ran on an upgraded database).
+                guard SQLite.exec(db, "DROP TABLE IF EXISTS search_fts_new"),
+                      SQLite.exec(db, "CREATE VIRTUAL TABLE search_fts_new USING fts5(" + Self.searchColumns + ")"),
+                      SQLite.exec(db, "DELETE FROM search_rows"),
+                      SQLite.exec(db, "INSERT INTO search_rows (path) SELECT path FROM documents"),
+                      SQLite.exec(db, "INSERT OR IGNORE INTO search_rows (path) SELECT path FROM files")
+                else { return false }
+                var read: OpaquePointer?, insert: OpaquePointer?
+                defer { sqlite3_finalize(read); sqlite3_finalize(insert) }
+                guard sqlite3_prepare_v2(db, """
+                        SELECT r.id, r.path, d.title, d.headings, d.text FROM search_rows r
+                        LEFT JOIN documents d ON d.path = r.path
+                        """, -1, &read, nil) == SQLITE_OK,
+                      sqlite3_prepare_v2(db, "INSERT INTO search_fts_new (rowid, name, title, headings, text) VALUES (?, ?, ?, ?, ?)",
+                                         -1, &insert, nil) == SQLITE_OK
+                else { return false }
+                var rows = 0
+                while sqlite3_step(read) == SQLITE_ROW {
+                    guard let path = SQLite.string(read, 1) else { continue }
+                    sqlite3_reset(insert)
+                    sqlite3_bind_int64(insert, 1, sqlite3_column_int64(read, 0))
+                    SQLite.bind(insert, 2, Self.searchableName(path))
+                    SQLite.bind(insert, 3, SQLite.string(read, 2) ?? "")
+                    SQLite.bind(insert, 4, SQLite.string(read, 3) ?? "")
+                    SQLite.bind(insert, 5, SQLite.string(read, 4) ?? "")
+                    guard sqlite3_step(insert) == SQLITE_DONE else { return false }
+                    rows += 1
+                }
+                guard SQLite.exec(db, "DROP TABLE IF EXISTS search_vocab"),
+                      SQLite.exec(db, "DROP TABLE search_fts"),
+                      SQLite.exec(db, "ALTER TABLE search_fts_new RENAME TO search_fts"),
+                      SQLite.exec(db, "CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, 'row')")
+                else { return false }
                 setMeta("search_fts_layout", Self.contentlessLayout)
+                // Every document is in the index now, whatever the old copy got to.
+                setMeta("v2_copied", "1")
+                v2Copied = true
                 // The space the copy took is given back once, while the Mac is idle (`vacuumIfPending`).
                 setMeta("vacuum_pending", "1")
+                ActivityLog.write(.search, "content.db: search index rebuilt from documents and files, \(rows) rows")
                 return true
             },
             // The v1 word index over documents' text (26 MB): every search
@@ -730,7 +755,8 @@ actor ContentStore {
         let content = "{title headings text} : "
         // Each word as a prefix (it arrives stemmed), and "snowy" as "snow" too.
         func term(_ word: String) -> String {
-            Tokens.plainForm(word).map { "(\"\(word)\"* OR \"\($0)\")" } ?? "\"\(word)\"*"
+            if let other = Tokens.otherSpelling(word) { return "(\"\(word)\"* OR \"\(other)\"*)" }
+            return Tokens.plainForm(word).map { "(\"\(word)\"* OR \"\($0)\")" } ?? "\"\(word)\"*"
         }
         // 1. The words together, in order — a strong sign.
         if cleaned.count >= 2 {

@@ -60,8 +60,11 @@ enum DailyTools {
         case "downloads": return home.appendingPathComponent("Downloads")
         case "home": return home
         default:
+            // "Downloads/PIPL": from the home folder, like "~/Downloads/PIPL".
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            let full = trimmed.hasPrefix("/") || trimmed.hasPrefix("~") ? trimmed : "~/" + trimmed
             // Links resolved first: one in Downloads can point anywhere.
-            let url = URL(fileURLWithPath: (text as NSString).expandingTildeInPath).standardizedFileURL
+            let url = URL(fileURLWithPath: (full as NSString).expandingTildeInPath).standardizedFileURL
                 .resolvingSymlinksInPath()
             return url.path.hasPrefix(home.path + "/") && !isOffLimits(url) ? url : nil
         }
