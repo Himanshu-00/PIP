@@ -156,6 +156,15 @@ actor ContentStore {
                 setMeta("vacuum_pending", "1")
                 return true
             },
+            // The v1 word index over documents' text (26 MB): every search
+            // goes through search_fts now.
+            SQLite.Migration(version: 7, name: "drop documents_fts") { [unowned self] db in
+                let ok = ["documents_ai", "documents_ad", "documents_au"]
+                    .allSatisfy { SQLite.exec(db, "DROP TRIGGER IF EXISTS \($0)") }
+                    && SQLite.exec(db, "DROP TABLE IF EXISTS documents_fts")
+                if ok { setMeta("vacuum_pending", "1") }
+                return ok
+            },
         ]
     }
 
@@ -252,36 +261,6 @@ actor ContentStore {
                 text     TEXT NOT NULL,
                 read_at  REAL NOT NULL
             )
-            """,
-            // Not contentless: callers need the text back for scoring and snippets.
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-                text,
-                content = 'documents',
-                content_rowid = 'id',
-                tokenize = 'unicode61'
-            )
-            """,
-            // External-content FTS5 doesn't track its table by itself; these
-            // three keep the index honest. The 'delete' command is how FTS5 is
-            // told to retract a row it can no longer see.
-            """
-            CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-                INSERT INTO documents_fts(rowid, text) VALUES (new.id, new.text);
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-                INSERT INTO documents_fts(documents_fts, rowid, text)
-                VALUES ('delete', old.id, old.text);
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-                INSERT INTO documents_fts(documents_fts, rowid, text)
-                VALUES ('delete', old.id, old.text);
-                INSERT INTO documents_fts(rowid, text) VALUES (new.id, new.text);
-            END
             """,
             "CREATE INDEX IF NOT EXISTS documents_read_at ON documents(read_at)",
             // Files read that gave nothing; keeps the indexer from re-reading them.
@@ -610,9 +589,11 @@ actor ContentStore {
     }
 
     /// Search over what documents say (title, headings, text; not the name):
-    /// exact phrase first, then any word. Nil until v2 is ready.
+    /// exact phrase first, then any word. Nil without the v2 index.
     private func searchV2(words: [String], limit: Int, extensions: Set<String> = []) -> [Hit]? {
-        guard v2Ready, v2Copied, let database else { return nil }
+        // While an old install's v1 documents are still being copied in
+        // (`migrateStep`), what's copied so far.
+        guard v2Ready, let database else { return nil }
         var hits: [Hit] = []
         var seen = Set<String>()
 
@@ -1289,35 +1270,8 @@ actor ContentStore {
 
     func search(words: [String], limit: Int = 60) -> [Hit] {
         open()
-        guard ready, let database, !words.isEmpty else { return [] }
-        if let v2 = searchV2(words: words, limit: limit) { return v2 }
-        guard let expression = matchExpression(words) else { return [] }
-
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
-        let sql = """
-            SELECT d.path, d.title, bm25(documents_fts)
-            FROM documents_fts
-            JOIN documents d ON d.id = documents_fts.rowid
-            WHERE documents_fts MATCH ?
-            ORDER BY bm25(documents_fts)
-            LIMIT ?
-            """
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
-        SQLite.bind(statement, 1, expression)
-        sqlite3_bind_int(statement, 2, Int32(limit))
-
-        var hits: [Hit] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let path = SQLite.string(statement, 0) else { continue }
-            // FTS5 returns bm25 as a negative number, most relevant most
-            // negative, because it sorts ascending by default. Flip it so the
-            // rest of the codebase's "larger is better" holds.
-            hits.append(Hit(url: URL(fileURLWithPath: path),
-                            title: SQLite.string(statement, 1),
-                            score: -sqlite3_column_double(statement, 2)))
-        }
-        return hits
+        guard ready, !words.isEmpty else { return [] }
+        return searchV2(words: words, limit: limit) ?? []
     }
 
     /// One stored document, for walking the whole store in order.
@@ -1350,21 +1304,6 @@ actor ContentStore {
                            text: SQLite.string(statement, 4) ?? ""))
         }
         return out
-    }
-
-    /// A MATCH expression that can't be a syntax error: each term quoted, as a
-    /// prefix, ORed (recall here, precision in the ranker).
-    private func matchExpression(_ words: [String]) -> String? {
-        // No length filter: `Tokens.of` decides what a word is (digits count).
-        let terms = words.compactMap { word -> String? in
-            // Strictly a quoting step: FTS5 treats `-`, `*`, `:`, `^`, `"` and
-            // `(` as operators, so anything that isn't alphanumeric has to go
-            // before the term is wrapped in quotes as a literal.
-            let cleaned = word.filter { $0.isLetter || $0.isNumber }
-            guard !cleaned.isEmpty else { return nil }
-            return "\"\(cleaned)\"*"
-        }
-        return terms.isEmpty ? nil : terms.joined(separator: " OR ")
     }
 
     // MARK: - Writing
